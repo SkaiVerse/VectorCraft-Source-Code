@@ -1,0 +1,214 @@
+name: Build native iPad IPA
+
+on:
+  workflow_dispatch:
+
+env:
+  IPHONEOS_DEPLOYMENT_TARGET: "18.4"
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # A quicker build for the first rounds: no whole-program link step, more parallel compiling.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Teach the app it runs on an Apple device
+        run: |
+          mkdir -p logs
+          python3 - <<'PYEOF'
+          import pathlib
+          report = []
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  report.append(f"{path}: FILE NOT FOUND")
+                  return
+              s = p.read_text()
+              for old, new in pairs:
+                  report.append(f"{path}: {s.count(old)} match(es) of {old[:70]!r}")
+                  s = s.replace(old, new)
+              p.write_text(s)
+          MAC = 'cfg!(target_os = "macos")'
+          APPLE = 'cfg!(any(target_os = "macos", target_os = "ios"))'
+          # Shortcuts: Apple's set (Command), never the Windows/Linux one.
+          patch("crates/ui-egui/src/keymap.rs", [
+              ("web.unwrap_or_else(Platform::current)",
+               "web.unwrap_or_else(|| if cfg!(target_os = \"ios\") { Platform::Mac } else { Platform::current() })"),
+          ])
+          # Menus show ⌘⇧⌥ symbols, not "Ctrl+Shift+".
+          patch("crates/ui-egui/src/menus/entries.rs", [
+              ("    if " + MAC + " {\n        let mut mods = String::new();",
+               "    if " + APPLE + " {\n        let mut mods = String::new();"),
+          ])
+          patch("crates/ui-egui/src/shortcut_editor.rs", [
+              ("if m.ctrl && (" + MAC + " || !m.command) {",
+               "if m.ctrl && (" + APPLE + " || !m.command) {"),
+          ])
+          # Fonts: the iPad keeps Apple's fonts in /System/Library/Fonts, as macOS does.
+          patch("crates/text/src/fontdb/dirs.rs", [
+              ("if " + MAC + " {\n        dirs.extend([\"/System/Library/Fonts\"",
+               "if " + APPLE + " {\n        dirs.extend([\"/System/Library/Fonts\""),
+          ])
+          pathlib.Path("logs/patch-result.txt").write_text("\n".join(report) + "\n")
+          PYEOF
+          cat logs/patch-result.txt
+
+      - name: Build the Rust core
+        run: |
+          set -o pipefail
+          mkdir -p logs ios/rust-lib
+          cargo rustc --release --target aarch64-apple-ios -p vectorcraft-ios -- --print native-static-libs 2>&1 | tee logs/rust-build.log
+          cp target/aarch64-apple-ios/release/libvectorcraft_ios.a ios/rust-lib/
+          NATIVE=$(grep -o 'native-static-libs:.*' logs/rust-build.log | head -1 | sed 's/native-static-libs: //')
+          echo "System libraries: $NATIVE"
+          echo "NATIVE_LIBS=$NATIVE" >> "$GITHUB_ENV"
+
+      - name: Save source for diagnosis
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p logs/src
+          for f in canvas/view.rs canvas/input.rs canvas/drag.rs prefs_dialog.rs workspaces.rs; do
+            if [ -f "crates/ui-egui/src/$f" ]; then cp "crates/ui-egui/src/$f" "logs/src/$(echo $f | tr '/' '_')"; fi
+          done
+          grep -rn -E "uiScaling|ui_scaling" crates --include=*.rs 2>/dev/null | head -60 > logs/src/ui-scaling-grep.txt
+          grep -rn -E "pub const TOUCH|fn set_workspace|\"window\.workspace" crates --include=*.rs 2>/dev/null | head -30 > logs/src/workspace-grep.txt
+          grep -n -E "pub (fn|struct|enum)" crates/ui-egui/src/place.rs 2>/dev/null | head -40 > logs/src/place-api.txt
+          true
+
+      - name: Make the app icon
+        run: |
+          ICONSET=ios/App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$ICONSET"
+          cat > ios/App/Assets.xcassets/Contents.json <<'JSONEOF'
+          {"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > "$ICONSET/Contents.json" <<'JSONEOF'
+          {"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > /tmp/make-icon.swift <<'SWIFTEOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          // usage: swift make-icon.swift <input.png | none> <output.png> [plain]
+          let args = CommandLine.arguments
+          let outPath = args[2]
+          let plain = args.count > 3 && args[3] == "plain"
+          let size = 1024
+          let space = CGColorSpace(name: CGColorSpace.sRGB)!
+          guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { exit(1) }
+
+          func readImage(_ path: String) -> CGImage? {
+              guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+              return CGImageSourceCreateImageAtIndex(src, 0, nil)
+          }
+
+          // The colour of one spot of the picture (fractions from the left and from the top).
+          func sample(_ img: CGImage, _ fx: Double, _ fy: Double) -> (Double, Double, Double) {
+              let one = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+              let w = Double(img.width), h = Double(img.height)
+              one.draw(img, in: CGRect(x: -fx * w, y: -(1 - fy) * h, width: w, height: h))
+              let p = one.data!.assumingMemoryBound(to: UInt8.self)
+              let a = max(Double(p[3]) / 255, 0.001)
+              return (min(Double(p[0]) / 255 / a, 1), min(Double(p[1]) / 255 / a, 1), min(Double(p[2]) / 255 / a, 1))
+          }
+
+          if args[1] != "none", let img = readImage(args[1]) {
+              // A desktop icon has transparent margins and rounded corners; iOS rounds the icon
+              // itself, so the picture is enlarged a little over a background of its own edge colour.
+              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.5, 0.14)
+              ctx.setFillColor(red: bg.0, green: bg.1, blue: bg.2, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              let scale = plain ? 1.0 : 1.24
+              let side = Double(size) * scale
+              let offset = -(side - Double(size)) / 2
+              ctx.interpolationQuality = .high
+              ctx.draw(img, in: CGRect(x: offset, y: offset, width: side, height: side))
+          } else {
+              ctx.setFillColor(red: 0.75, green: 0.12, blue: 0.16, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 1)
+              ctx.setLineWidth(70)
+              ctx.setLineCap(.round)
+              ctx.setLineJoin(.round)
+              ctx.move(to: CGPoint(x: 280, y: 760))
+              ctx.addLine(to: CGPoint(x: 512, y: 260))
+              ctx.addLine(to: CGPoint(x: 744, y: 760))
+              ctx.strokePath()
+          }
+
+          guard let result = ctx.makeImage(),
+                let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outPath) as CFURL, "public.png" as CFString, 1, nil) else { exit(1) }
+          CGImageDestinationAddImage(dest, result, nil)
+          if !CGImageDestinationFinalize(dest) { exit(1) }
+          SWIFTEOF
+          REPO_ICON=$(python3 - <<'PYEOF'
+          import pathlib
+          found = [p for p in pathlib.Path("assets").rglob("*.png") if "icon" in str(p).lower()] if pathlib.Path("assets").exists() else []
+          def score(p):
+              s = str(p)
+              return (("1024" in s) * 2 + ("512" in s) + ("macos" in s), p.stat().st_size)
+          found.sort(key=score, reverse=True)
+          print(found[0] if found else "")
+          PYEOF
+          )
+          if [ -f ios/AppIcon.png ]; then
+            echo "Using your own icon: ios/AppIcon.png"
+            swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
+          elif [ -n "$REPO_ICON" ]; then
+            echo "Using the icon from the repo: $REPO_ICON"
+            swift /tmp/make-icon.swift "$REPO_ICON" "$ICONSET/AppIcon-1024.png"
+          else
+            echo "No icon picture found: using the plain fallback"
+            swift /tmp/make-icon.swift none "$ICONSET/AppIcon-1024.png"
+          fi
+          ls -la "$ICONSET"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build the app (unsigned)
+        run: |
+          set -o pipefail
+          cd ios
+          xcodebuild -project VectorCraft.xcodeproj -scheme VectorCraft \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            NATIVE_LIBS="$NATIVE_LIBS" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ../logs/xcodebuild.log
+
+      - name: Package IPA
+        run: |
+          cd ios
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/VectorCraft.app Payload/
+          zip -qr ../VectorCraft.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VectorCraft-ipa
+          path: VectorCraft.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: logs
