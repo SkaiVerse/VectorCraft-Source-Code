@@ -1,0 +1,21 @@
+[package]
+name = "vectorcraft-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "vectorcraft_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+vectorcraft-engine = { workspace = true, features = ["bundled-fonts", "heif"] }
+vectorcraft-ui-egui = { workspace = true }
+vectorcraft-text = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { version = "0.37", default-features = false }
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
+pollster = "1"
+serde_json = { workspace = true }
+log = { workspace = true }
