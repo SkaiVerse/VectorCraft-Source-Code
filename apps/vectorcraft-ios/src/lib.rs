@@ -139,7 +139,29 @@ fn hid_to_key(hid: u32) -> Option<egui::Key> {
 const SELECTING: [&str; 6] = ["selection", "directSelection", "groupSelection", "magicWand", "lasso", "perspectiveSelection"];
 
 fn is_drawing_tool(id: &str) -> bool {
-    !SELECTING.contains(&id) && !matches!(id, "hand" | "rotateView" | "zoom" | "printTiling")
+    !SELECTING.contains(&id) && !matches!(id, "hand" | "rotateView" | "zoom" | "printTiling" | "eyedropper")
+}
+
+/// How long a press must stay still to count as "press and hold".
+const HOLD: Duration = Duration::from_millis(450);
+
+/// A press that waits before the app sees it.
+#[derive(Clone, Copy, PartialEq)]
+enum GateKind {
+    /// One frame, so the tool is hovering over the spot (a type tool, the Pencil tool editing a
+    /// path) before the press lands, as with a mouse that moved there first.
+    Frame,
+    /// The eyedropper: a quick tap applies the picked style (Option-click), a held press picks.
+    Eyedropper,
+    /// The Pen tool: a held press turns the anchor under it into a corner (Option-click).
+    PenHold,
+}
+
+#[derive(Clone, Copy)]
+struct Gate {
+    kind: GateKind,
+    started: Instant,
+    origin: Pos2,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -332,6 +354,10 @@ struct Host {
     shift_finger: Option<i32>,
     last_pen_end: Option<Instant>,
     tool_name: CString,
+    gate: Option<Gate>,
+    deferred: Vec<egui::Event>,
+    /// Option is held by a press-and-hold (the Pen tool's corner conversion).
+    hold_alt: bool,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -374,6 +400,12 @@ impl Host {
 
         let mut app = VectorcraftApp::new(Session::new(), services);
         load_prefs(&mut app);
+        // The built-in Touch workspace is gone (there is Touch Space); a saved layout named after
+        // it goes back to Essentials.
+        if app.ui.workspace == "Touch" {
+            app.ui.workspace = "Essentials".to_string();
+        }
+        app.ui.touch_workspace_restore = None;
 
         // What the user keeps lives next to the preferences, as on the desktop.
         app.session.swatch_libraries.set_user_dir(dir_string("Swatches"));
@@ -413,6 +445,9 @@ impl Host {
             shift_finger: None,
             last_pen_end: None,
             tool_name: CString::default(),
+            gate: None,
+            deferred: Vec::new(),
+            hold_alt: false,
         })
     }
 
@@ -421,7 +456,51 @@ impl Host {
     }
 
     fn push(&mut self, e: egui::Event) {
-        self.events.push(e);
+        if self.gate.is_some() {
+            self.deferred.push(e);
+        } else {
+            self.events.push(e);
+        }
+        self.wake();
+    }
+
+    /// Holds the press (and all that follows it) back until the gate opens.
+    fn begin_gate(&mut self, pos: Pos2, finger: bool) {
+        let tool = self.app.session.tool_id().to_string();
+        let kind = match tool.as_str() {
+            "eyedropper" => GateKind::Eyedropper,
+            "pen" if !finger => GateKind::PenHold,
+            _ => GateKind::Frame,
+        };
+        self.gate = Some(Gate { kind, started: Instant::now(), origin: pos });
+    }
+
+    /// Lets the held events through, with Option held when `alt` (a tap with the eyedropper).
+    fn flush_gate(&mut self, alt: bool) {
+        if self.gate.take().is_none() {
+            return;
+        }
+        let mut queued = std::mem::take(&mut self.deferred);
+        if alt {
+            for e in &mut queued {
+                match e {
+                    Event::PointerButton { modifiers, .. } => modifiers.alt = true,
+                    Event::ModifiersChanged(m) => m.alt = true,
+                    _ => {}
+                }
+            }
+            let mut m = self.modifiers;
+            m.alt = true;
+            self.events.push(Event::ModifiersChanged(m));
+        }
+        self.events.extend(queued);
+        if alt && !self.hold_alt {
+            // The tap is complete: Option is let go again.
+            let mut m = self.modifiers;
+            m.alt = false;
+            self.modifiers = m;
+            self.events.push(Event::ModifiersChanged(m));
+        }
         self.wake();
     }
 
@@ -461,6 +540,13 @@ impl Host {
             self.push(Event::ModifiersChanged(mods));
             self.modifiers = mods;
             self.push(Event::PointerButton { pos, button, pressed: false, modifiers: mods });
+            if self.hold_alt {
+                self.hold_alt = false;
+                let mut m = mods;
+                m.alt = false;
+                self.modifiers = m;
+                self.push(Event::ModifiersChanged(m));
+            }
         }
     }
 
@@ -498,11 +584,15 @@ impl Host {
                     self.finger_draw = false;
                     self.cancel_fingers(pos, mods);
                     self.pen_sample(pressure, pose);
+                    // The tool hovers over the spot first, then the press lands.
+                    self.push(Event::PointerMoved(pos));
+                    self.begin_gate(pos, false);
                     self.pen = Some(id);
                     self.push_touch(PEN_DEVICE, id, TouchPhase::Start, pos, force);
                     self.press(id, pos, PointerButton::Primary, mods);
                 }
                 TouchPhase::Move if self.pen == Some(id) => {
+                    self.leave_gate_on_move(pos);
                     self.pen_sample(pressure, pose);
                     self.push_touch(PEN_DEVICE, id, TouchPhase::Move, pos, force);
                     self.push(Event::PointerMoved(pos));
@@ -515,6 +605,7 @@ impl Host {
                     touch::set_pen_seen(false);
                     self.push_touch(PEN_DEVICE, id, phase, pos, None);
                     self.release(pos, mods);
+                    self.end_gate_on_lift(phase == TouchPhase::End);
                 }
                 _ => {}
             }
@@ -539,6 +630,11 @@ impl Host {
                         touch::set_source(Source::Finger);
                         self.stylus.set(None);
                         self.begin_finger_tool();
+                        let tool = self.app.session.tool_id().to_string();
+                        if self.finger_draw || tool == "eyedropper" {
+                            self.push(Event::PointerMoved(pos));
+                            self.begin_gate(pos, true);
+                        }
                         self.press(id, pos, PointerButton::Primary, mods);
                     }
                 }
@@ -549,6 +645,7 @@ impl Host {
                     self.set_modifiers(m);
                 }
                 TouchPhase::Move if self.fingers.contains(&id) => {
+                    self.leave_gate_on_move(pos);
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Move, pos, None);
                     if self.primary == Some(id) {
                         self.push(Event::PointerMoved(pos));
@@ -560,6 +657,7 @@ impl Host {
                     if self.primary == Some(id) {
                         self.release(pos, mods);
                         self.push(Event::PointerGone);
+                        self.end_gate_on_lift(phase == TouchPhase::End);
                     }
                     if self.fingers.is_empty() && self.restore_tool.is_some() {
                         // Give the drawing tool back once the app has seen the release.
@@ -583,9 +681,29 @@ impl Host {
         }
     }
 
+    /// A held press that moves is a drag: it goes through as it is.
+    fn leave_gate_on_move(&mut self, pos: Pos2) {
+        if let Some(g) = self.gate
+            && g.kind != GateKind::Frame
+            && (pos - g.origin).length() > 8.0
+        {
+            self.flush_gate(false);
+        }
+    }
+
+    /// The press lifted while held back: the tap goes through (an eyedropper tap applies).
+    fn end_gate_on_lift(&mut self, completed: bool) {
+        if let Some(g) = self.gate {
+            self.flush_gate(completed && g.kind == GateKind::Eyedropper);
+        }
+    }
+
     fn with_shift(&self, mut m: egui::Modifiers) -> egui::Modifiers {
         if self.shift_finger.is_some() {
             m.shift = true;
+        }
+        if self.hold_alt {
+            m.alt = true;
         }
         m
     }
@@ -645,6 +763,22 @@ impl Host {
 
         // Our own Touch Space replaces the built-in Touch workspace: never switch to it by itself.
         self.app.session.prefs.touch_workspace = false;
+
+        // A press held back for press-and-hold: held long enough, it goes through.
+        if let Some(g) = self.gate {
+            if g.started.elapsed() >= HOLD {
+                match g.kind {
+                    GateKind::Eyedropper => self.flush_gate(false),
+                    GateKind::PenHold => {
+                        self.hold_alt = true;
+                        self.flush_gate(true);
+                    }
+                    GateKind::Frame => {}
+                }
+            } else if g.kind != GateKind::Frame {
+                wake_at(&self.deadline, Instant::now() + Duration::from_millis(40));
+            }
+        }
 
         let ctx = self.ctx.clone();
         self.app.raw_input_hook(&ctx, &mut raw);
@@ -739,6 +873,10 @@ impl Host {
 
         for id in full.textures_delta.free.drain() {
             gpu.renderer.free_texture(&id);
+        }
+        // The app has now hovered over the spot: the press waiting behind it goes through.
+        if self.gate.is_some_and(|g| g.kind == GateKind::Frame) {
+            self.flush_gate(false);
         }
         self.flags(true)
     }
