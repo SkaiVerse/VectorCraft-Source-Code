@@ -30,7 +30,6 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     private let actionBar = ActionBarView()
     private var arcMenu: ArcMenuView?
     private var assistivePlaced = false
-    private var toolBeforeEraser: String?
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -73,14 +72,14 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         metal.onPasteText = { UIPasteboard.general.string }
         metal.onPrint = { [weak self] title, data in self?.printPDF(title: title, data: data) }
 
-        // Apple Pencil: squeeze opens the tool arc (and the context menu); double tap swaps to
-        // the eraser and back.
+        // Apple Pencil: squeeze opens the tool arc (and the context menu); double tap goes to the
+        // next tool in the same tray.
         metal.onPencilSqueeze = { [weak self] point in
             guard let self = self else { return }
             self.metal.contextClick(at: point)
             self.showArcMenu(at: point)
         }
-        metal.onPencilTap = { [weak self] in self?.swapEraser() }
+        metal.onPencilTap = { [weak self] in self?.cycleTray() }
         metal.onFingerDrawChanged = { [weak self] on in self?.assistive.setFingerDraw(on) }
 
         // On-screen buttons.
@@ -126,9 +125,10 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let safe = view.safeAreaInsets
+        // Beside the toolbar, not over it.
         actionBar.frame.origin = CGPoint(
-            x: safe.left + 14,
-            y: view.bounds.height - safe.bottom - actionBar.bounds.height - 96
+            x: safe.left + 80,
+            y: view.bounds.height - safe.bottom - actionBar.bounds.height - 70
         )
         if !assistivePlaced && view.bounds.width > 100 {
             assistive.restorePosition(in: view)
@@ -165,15 +165,40 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         arcMenu = nil
     }
 
-    /// Apple Pencil double tap: the eraser, and back to the tool that was in use.
-    private func swapEraser() {
+    /// The tools that share a tray in the toolbar (from the app's own tool list).
+    private static let trays: [[String]] = [
+        ["directSelection", "groupSelection"],
+        ["pen", "addAnchor", "deleteAnchor", "anchorPoint"],
+        ["type", "areaType", "typeOnPath", "verticalType", "verticalAreaType", "verticalTypeOnPath", "touchType"],
+        ["lineSegment", "arc", "spiral", "rectangularGrid", "polarGrid"],
+        ["rectangle", "roundedRectangle", "ellipse", "polygon", "star", "flare"],
+        ["paintbrush", "blobBrush"],
+        ["shaper", "pencil", "smooth", "pathEraser", "join"],
+        ["eraser", "scissors", "knife", "mirrorCut", "lineCut", "rectCut"],
+        ["rotate", "reflect"],
+        ["scale", "shear", "reshape"],
+        ["width", "warp", "twirl", "pucker", "bloat", "scallop", "crystallize", "wrinkle"],
+        ["freeTransform", "puppetWarp"],
+        ["shapeBuilder", "livePaintBucket", "livePaintSelection"],
+        ["perspectiveGrid", "perspectiveSelection"],
+        ["eyedropper", "measure"],
+        ["blend", "objectsOnPath"],
+        ["symbolSprayer", "symbolShifter", "symbolScruncher", "symbolSizer", "symbolSpinner", "symbolStainer", "symbolScreener", "symbolStyler"],
+        ["columnGraph", "stackedColumnGraph", "barGraph", "stackedBarGraph", "lineGraph", "areaGraph", "scatterGraph", "pieGraph", "radarGraph"],
+        ["artboard", "slice", "sliceSelection"],
+        ["hand", "rotateView", "printTiling"]
+    ]
+
+    /// Apple Pencil double tap: the next tool in the same tray (Pen: Add Anchor, Delete Anchor,
+    /// Anchor Point; Type: Area Type, Type on a Path ...). A tool alone in its tray stays as it is.
+    private func cycleTray() {
         let now = metal.currentTool()
-        if now == "eraser" {
-            if let back = toolBeforeEraser { pickTool([back]) }
-        } else {
-            toolBeforeEraser = now
-            pickTool(["eraser"])
+        guard let tray = VectorCraftViewController.trays.first(where: { $0.contains(now) }),
+              let at = tray.firstIndex(of: now) else {
+            vcLog("double tap: \(now) has no other tool in its tray")
+            return
         }
+        pickTool([tray[(at + 1) % tray.count]])
     }
 
     // MARK: Fonts
