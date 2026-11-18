@@ -1,0 +1,38 @@
+name: probe3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect sources
+        run: |
+          set +e
+          mkdir -p out/toolbar out/lists
+          U=crates/ui-egui/src
+          cp $U/toolbar.rs out/ 2>/dev/null
+          for f in $(find $U/toolbar -name '*.rs' ! -name '*test*' 2>/dev/null); do cp "$f" "out/toolbar/$(basename $f)"; done
+          cp $U/custom_toolbars.rs out/ 2>/dev/null
+          cp $U/edit_toolbar.rs out/ 2>/dev/null
+          cp $U/chrome.rs out/ 2>/dev/null
+          ls -R $U 2>/dev/null | head -500 > out/lists/ui-files.txt
+          ls -R crates/tools/src 2>/dev/null | head -300 > out/lists/tools-files.txt
+          find . \( -iname '*tool-selection*' -o -iname '*tool-pen*' -o -iname '*tool-eraser*' \) -not -path './target/*' 2>/dev/null | head -20 > out/lists/icon-files.txt
+          find . -name '*.svg' -not -path './target/*' 2>/dev/null | head -80 > out/lists/svg-files.txt
+          ls assets 2>/dev/null | head -50 > out/lists/assets.txt
+          grep -rn -B3 -A28 'view\.rotate' crates --include=*.rs 2>/dev/null | grep -v '/tests/' | head -320 > out/rotate-view.txt
+          grep -rn -E '"(object|transform|selection|edit)\.[a-zA-Z]*[Rr]otate[A-Za-z]*"' crates --include=*.rs 2>/dev/null | grep -v '/tests/' | head -40 > out/rotate-object.txt
+          grep -rn "ScrollArea" $U/toolbar.rs $U/toolbar 2>/dev/null | head -30 > out/lists/toolbar-scroll.txt
+          ls crates/tools/src/pen* 2>/dev/null > out/lists/pen-files.txt
+          grep -rln -i "eyedropper" crates --include=*.rs 2>/dev/null | head -20 > out/lists/eyedropper-files.txt
+          true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe3-results
+          path: out
