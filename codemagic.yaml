@@ -1,0 +1,361 @@
+workflows:
+  vectorcraft-ipa:
+    name: VectorCraft iPad Build (Unsigned IPA)
+    instance_type: mac_mini_m2
+    # Codemagic's maximum allowed build duration is 120 minutes
+    max_build_duration: 120
+    environment:
+      xcode: latest
+      vars:
+        IPHONEOS_DEPLOYMENT_TARGET: "18.4"
+        CARGO_TERM_COLOR: never
+        CARGO_INCREMENTAL: "0"
+        # Faster release builds on CI: disable whole-program LTO and parallelize codegen
+        CARGO_PROFILE_RELEASE_LTO: "false"
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        # Prevent Homebrew from spending minutes auto-updating when installing xcodegen
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+        HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    cache:
+      cache_paths:
+        - $HOME/.cargo/registry
+        - $HOME/.cargo/git
+        - $CM_BUILD_DIR/target
+    scripts:
+      - name: Log build environment & SDKs
+        script: |
+          mkdir -p logs
+          {
+            echo "=== Xcode ==="
+            xcodebuild -version
+            echo "=== iOS SDKs ==="
+            xcodebuild -showsdks | grep -i iphoneos || true
+            echo "=== System ==="
+            uname -a
+            sysctl -n hw.ncpu
+          } | tee logs/env.log
+
+      - name: Install Rust for iPad (aarch64-apple-ios)
+        script: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          rustc --version
+          cargo --version
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$CM_ENV"
+
+      - name: Teach the app it runs on an Apple device
+        script: |
+          set -euo pipefail
+          mkdir -p logs
+          python3 - <<'PYEOF'
+          import pathlib
+          import textwrap
+
+          report = []
+
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  report.append(f"{path}: FILE NOT FOUND")
+                  return
+              s = p.read_text()
+              for old, new in pairs:
+                  count = s.count(old)
+                  report.append(f"{path}: {count} match(es) of {old[:70]!r}")
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+          MAC = 'cfg!(target_os = "macos")'
+          APPLE = 'cfg!(any(target_os = "macos", target_os = "ios"))'
+
+          # Shortcuts: Apple's set (Command), never the Windows/Linux one.
+          patch("crates/ui-egui/src/keymap.rs", [
+              (
+                  "web.unwrap_or_else(Platform::current)",
+                  'web.unwrap_or_else(|| if cfg!(target_os = "ios") { Platform::Mac } else { Platform::current() })',
+              ),
+          ])
+
+          # Menus show ⌘⇧⌥ symbols, not "Ctrl+Shift+".
+          patch("crates/ui-egui/src/menus/entries.rs", [
+              (
+                  "    if " + MAC + " {\n        let mut mods = String::new();",
+                  "    if " + APPLE + " {\n        let mut mods = String::new();",
+              ),
+          ])
+          patch("crates/ui-egui/src/shortcut_editor.rs", [
+              (
+                  "if m.ctrl && (" + MAC + " || !m.command) {",
+                  "if m.ctrl && (" + APPLE + " || !m.command) {",
+              ),
+          ])
+
+          # Fonts: the iPad keeps Apple's fonts in /System/Library/Fonts, as macOS does.
+          patch("crates/text/src/fontdb/dirs.rs", [
+              (
+                  "if " + MAC + ' {\n        dirs.extend(["/System/Library/Fonts"',
+                  "if " + APPLE + ' {\n        dirs.extend(["/System/Library/Fonts"',
+              ),
+          ])
+
+          # Replace the built-in Touch workspace with Touch Space:
+          # every tool group in its tray, and panels collapsed to icons until opened.
+          patch("crates/ui-egui/src/workspaces.rs", [
+              (
+                  '        w(TOUCH, &|x| {\n'
+                  '            x.control_bar = true;\n'
+                  '            x.toolbar = true;\n'
+                  '            x.toolbar_advanced = true;\n'
+                  '            x.task_bar = true;\n'
+                  '            x.open_panel = Some("align".into());\n'
+                  '        }),\n',
+                  '        w("Touch Space", &|x| {\n'
+                  '            x.toolbar = true;\n'
+                  '            x.toolbar_advanced = true;\n'
+                  '            x.dock_collapsed = true;\n'
+                  '            x.open_panel = None;\n'
+                  '        }),\n',
+              ),
+          ])
+
+          # Toolbar: finger drag scrolls tools (buttons only sense clicks unless editing),
+          # and Undo, Redo, and Delete get a dedicated section under the other controls.
+          ui_src = "".join(f.read_text() for f in pathlib.Path("crates/ui-egui/src").rglob("*.rs"))
+
+          def icon(cands, last):
+              for c in cands:
+                  if '"' + c + '"' in ui_src and pathlib.Path("assets/icons/" + c + ".svg").exists():
+                      return c
+              for c in cands:
+                  if pathlib.Path("assets/icons/" + c + ".svg").exists():
+                      return c
+              return last
+
+          undo_i = icon(["undo-2", "undo", "rotate-ccw"], "ellipsis")
+          redo_i = icon(["redo-2", "redo", "rotate-cw"], "ellipsis")
+          trash_i = icon(["trash-2", "trash", "delete"], "ellipsis")
+          report.append(f"toolbar icons: {undo_i} {redo_i} {trash_i}")
+
+          touch_fn = textwrap.dedent('''
+              /// Undo, Redo and Delete: a section of their own under the other controls (as Affinity's
+              /// toolbar has them), for a finger or the pencil.
+              fn touch_actions(app: &mut VectorcraftApp, ui: &mut Ui, t: &Tokens) {
+                  ui.add_space(6.0);
+                  let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+                  ui.painter().line_segment([r.left_center() + vec2(6.0, 0.0), r.right_center() - vec2(6.0, 0.0)], Stroke::new(1.0, t.text_disabled));
+                  ui.add_space(6.0);
+                  ui.vertical_centered(|ui| {
+                      for (icon, tip, cmd) in [("@UNDO@", "Undo", "edit.undo"), ("@REDO@", "Redo", "edit.redo"), ("@TRASH@", "Delete", "edit.clear")] {
+                          if widgets::icon_button(ui, icon, tip, false, 30.0).clicked() {
+                              app.run(cmd, json!({})).ok();
+                          }
+                      }
+                  });
+                  ui.add_space(10.0);
+              }
+          ''').replace("@UNDO@", undo_i).replace("@REDO@", redo_i).replace("@TRASH@", trash_i)
+
+          patch("crates/ui-egui/src/toolbar.rs", [
+              (
+                  "let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), Sense::click_and_drag());",
+                  "let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), if editing { Sense::click_and_drag() } else { Sense::click() });",
+              ),
+              (
+                  "        ui.add_space(8.0);\n        bottom_controls(app, ui, &t, cols);\n    });",
+                  "        ui.add_space(8.0);\n        bottom_controls(app, ui, &t, cols);\n        touch_actions(app, ui, &t);\n    });",
+              ),
+          ])
+          tb = pathlib.Path("crates/ui-egui/src/toolbar.rs")
+          tb.write_text(tb.read_text() + "\n" + touch_fn)
+
+          # Draw custom tool cursors (as on macOS) instead of requesting OS cursors.
+          patch("crates/ui-egui/src/cursors.rs", [
+              (
+                  'pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_arch = "wasm32"));',
+                  'pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"));',
+              ),
+          ])
+
+          pathlib.Path("logs/patch-result.txt").write_text("\n".join(report) + "\n")
+          PYEOF
+          cat logs/patch-result.txt
+
+      - name: Save source snapshot for diagnosis
+        ignore_failure: true
+        script: |
+          # Run before Rust compilation so diagnostic snapshots are always captured even if cargo fails
+          set +e
+          mkdir -p logs/src logs/src/toolbar logs/src/tools
+          for f in canvas/view.rs canvas/input.rs canvas/drag.rs prefs_dialog.rs workspaces.rs; do
+            if [ -f "crates/ui-egui/src/$f" ]; then
+              cp "crates/ui-egui/src/$f" "logs/src/$(echo "$f" | tr '/' '_')"
+            fi
+          done
+          grep -rn -E "uiScaling|ui_scaling" crates --include=*.rs 2>/dev/null | head -60 > logs/src/ui-scaling-grep.txt
+          grep -rn -E "pub const TOUCH|fn set_workspace|\"window\.workspace" crates --include=*.rs 2>/dev/null | head -30 > logs/src/workspace-grep.txt
+          grep -n -E "pub (fn|struct|enum)" crates/ui-egui/src/place.rs 2>/dev/null | head -40 > logs/src/place-api.txt
+          cp -R crates/ui-egui/src/toolbar logs/src/toolbar/ 2>/dev/null
+          find logs/src/toolbar -name '*test*' -delete 2>/dev/null
+          cp crates/tools/src/catalog.rs logs/src/tools/ 2>/dev/null
+          cp -R crates/tools/src/catalog logs/src/tools/ 2>/dev/null
+          grep -rn -E "view\.rotate|rotate_view|rotateView|\"object\.rotate|transform\.rotate" crates --include=*.rs 2>/dev/null | grep -v test | head -80 > logs/src/rotate-grep.txt
+          grep -rn -i "tray" crates/tools/src crates/ui-egui/src --include=*.rs 2>/dev/null | grep -v test | head -120 > logs/src/tray-grep.txt
+          cp crates/ui-egui/src/toolbar.rs logs/src/ 2>/dev/null
+          grep -rn -B2 -A30 "fn strip_scroll" crates/ui-egui/src --include=*.rs 2>/dev/null | head -80 > logs/src/strip-scroll.txt
+          sed -n 320,420p crates/engine/src/cmd/object/transform.rs 2>/dev/null > logs/src/transform-rotate.txt
+          true
+
+      - name: Build the Rust core
+        script: |
+          set -euo pipefail
+          mkdir -p logs ios/rust-lib
+          cargo rustc --release --target aarch64-apple-ios -p vectorcraft-ios -- --print native-static-libs 2>&1 | tee logs/rust-build.log
+          cp target/aarch64-apple-ios/release/libvectorcraft_ios.a ios/rust-lib/
+          ls -lh ios/rust-lib/libvectorcraft_ios.a
+          NATIVE=$(grep -o 'native-static-libs:.*' logs/rust-build.log | head -1 | sed 's/native-static-libs: //' | tr -d '\r\n')
+          echo "System libraries: $NATIVE"
+          printf '%s' "$NATIVE" > logs/native-libs.txt
+          echo "NATIVE_LIBS=$NATIVE" >> "$CM_ENV"
+
+      - name: Make the app icon
+        script: |
+          set -euo pipefail
+          ICONSET=ios/App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$ICONSET"
+          cat > ios/App/Assets.xcassets/Contents.json <<'JSONEOF'
+          {"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > "$ICONSET/Contents.json" <<'JSONEOF'
+          {"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > /tmp/make-icon.swift <<'SWIFTEOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          // usage: swift make-icon.swift <input.png | none> <output.png> [plain]
+          let args = CommandLine.arguments
+          let outPath = args[2]
+          let plain = args.count > 3 && args[3] == "plain"
+          let size = 1024
+          let space = CGColorSpace(name: CGColorSpace.sRGB)!
+          guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { exit(1) }
+
+          func readImage(_ path: String) -> CGImage? {
+              guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+              return CGImageSourceCreateImageAtIndex(src, 0, nil)
+          }
+
+          func sample(_ img: CGImage, _ fx: Double, _ fy: Double) -> (Double, Double, Double) {
+              let one = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+              let w = Double(img.width), h = Double(img.height)
+              one.draw(img, in: CGRect(x: -fx * w, y: -(1 - fy) * h, width: w, height: h))
+              let p = one.data!.assumingMemoryBound(to: UInt8.self)
+              let a = max(Double(p[3]) / 255, 0.001)
+              return (min(Double(p[0]) / 255 / a, 1), min(Double(p[1]) / 255 / a, 1), min(Double(p[2]) / 255 / a, 1))
+          }
+
+          if args[1] != "none", let img = readImage(args[1]) {
+              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.5, 0.14)
+              ctx.setFillColor(red: bg.0, green: bg.1, blue: bg.2, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              let scale = plain ? 1.0 : 1.24
+              let side = Double(size) * scale
+              let offset = -(side - Double(size)) / 2
+              ctx.interpolationQuality = .high
+              ctx.draw(img, in: CGRect(x: offset, y: offset, width: side, height: side))
+          } else {
+              ctx.setFillColor(red: 0.75, green: 0.12, blue: 0.16, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 1)
+              ctx.setLineWidth(70)
+              ctx.setLineCap(.round)
+              ctx.setLineJoin(.round)
+              ctx.move(to: CGPoint(x: 280, y: 760))
+              ctx.addLine(to: CGPoint(x: 512, y: 260))
+              ctx.addLine(to: CGPoint(x: 744, y: 760))
+              ctx.strokePath()
+          }
+
+          guard let result = ctx.makeImage(),
+                let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outPath) as CFURL, "public.png" as CFString, 1, nil) else { exit(1) }
+          CGImageDestinationAddImage(dest, result, nil)
+          if !CGImageDestinationFinalize(dest) { exit(1) }
+          SWIFTEOF
+          REPO_ICON=$(python3 - <<'PYEOF'
+          import pathlib
+          found = [p for p in pathlib.Path("assets").rglob("*.png") if "icon" in str(p).lower()] if pathlib.Path("assets").exists() else []
+          def score(p):
+              s = str(p)
+              return (("1024" in s) * 2 + ("512" in s) + ("macos" in s), p.stat().st_size)
+          found.sort(key=score, reverse=True)
+          print(found[0] if found else "")
+          PYEOF
+          )
+          if [ -f ios/AppIcon.png ]; then
+            echo "Using custom icon: ios/AppIcon.png"
+            swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
+          elif [ -n "$REPO_ICON" ]; then
+            echo "Using icon from repo: $REPO_ICON"
+            swift /tmp/make-icon.swift "$REPO_ICON" "$ICONSET/AppIcon-1024.png"
+          else
+            echo "No icon found: using fallback"
+            swift /tmp/make-icon.swift none "$ICONSET/AppIcon-1024.png"
+          fi
+          ls -la "$ICONSET"
+
+      - name: Install XcodeGen & generate Xcode project
+        script: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+          cd ios
+          xcodegen generate
+
+      - name: Build the app (unsigned)
+        script: |
+          set -euo pipefail
+          NATIVE_LIBS="${NATIVE_LIBS:-$(cat logs/native-libs.txt 2>/dev/null || true)}"
+          echo "Linking with NATIVE_LIBS: $NATIVE_LIBS"
+          cd ios
+          xcodebuild \
+            -project VectorCraft.xcodeproj \
+            -scheme VectorCraft \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            NATIVE_LIBS="$NATIVE_LIBS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build 2>&1 | tee ../logs/xcodebuild.log
+
+      - name: Package & verify unsigned IPA
+        script: |
+          set -euo pipefail
+          cd ios
+          APP_PATH="build/Build/Products/Release-iphoneos/VectorCraft.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "ERROR: $APP_PATH not found"
+            exit 1
+          fi
+          rm -rf Payload ../VectorCraft.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr ../VectorCraft.ipa Payload
+          ls -lh ../VectorCraft.ipa
+          unzip -l ../VectorCraft.ipa | head -n 30
+
+    artifacts:
+      - VectorCraft.ipa
+      - logs/**
