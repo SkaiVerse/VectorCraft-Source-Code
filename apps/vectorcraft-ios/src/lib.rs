@@ -1225,3 +1225,19 @@ pub unsafe extern "C" fn vc_tool_id(h: *mut c_void) -> *const c_char {
         None => std::ptr::null(),
     }
 }
+
+/// Whether anything is selected: a no-turn rotation is tried (it refuses with a message about the
+/// selection when there is none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_has_selection(h: *mut c_void) -> c_int {
+    guard(0, || {
+        let Some(h) = (unsafe { host(h) }) else { return 0 };
+        match h.app.run("object.rotate", json!({"angle": 0})) {
+            Ok(_) => 1,
+            Err(e) => {
+                let e = e.to_lowercase();
+                c_int::from(!(e.contains("select") || e.contains("nothing")))
+            }
+        }
+    })
+}
