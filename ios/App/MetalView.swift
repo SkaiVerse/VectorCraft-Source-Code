@@ -19,6 +19,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     var onPencilTap: (() -> Void)?
     var onPencilSqueeze: ((CGPoint) -> Void)?
     var onFingerDrawChanged: ((Bool) -> Void)?
+    /// The twist in degrees while a selection is being turned (nil: the gesture is over).
+    var onTwist: ((Double?) -> Void)?
     /// Modifier keys held down on screen (Assistive Touch): added to every real one.
     var stickyMods: UInt32 = 0 {
         didSet { if let h = handle { vc_mods(h, stickyMods) } }
@@ -29,6 +31,10 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     /// A touch wider than this (points) is a resting palm, not a fingertip.
     private let palmRadius: CGFloat = 38
     private var ignoredTouches = Set<ObjectIdentifier>()
+    private var twistLast = 0.0
+    private var twistTotal = 0.0
+    private var twistActive = false
+    private var twistTurnsSelection = false
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
@@ -443,6 +449,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         wheel.delegate = self
         addGestureRecognizer(wheel)
 
+        // Two fingers twisting: the selection turns with them, or the canvas when nothing is
+        // selected. (The fingers also reach the app as touches, which pan and zoom.)
+        let twist = UIRotationGestureRecognizer(target: self, action: #selector(twisted(_:)))
+        twist.cancelsTouchesInView = false
+        twist.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        twist.delegate = self
+        addGestureRecognizer(twist)
+
         // Trackpad pinch. Finger pinches reach the app as touches, which it zooms with itself.
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
         pinch.cancelsTouchesInView = false
@@ -470,6 +484,45 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
         if t != .zero { vc_scroll(h, Float(t.x), Float(t.y), modBits(g.modifierFlags)) }
+    }
+
+    @objc private func twisted(_ g: UIRotationGestureRecognizer) {
+        guard let h = handle else { return }
+        let degrees = Double(g.rotation) * 180 / Double.pi
+        switch g.state {
+        case .began:
+            twistActive = false
+            twistTotal = 0
+            twistLast = 0
+            twistTurnsSelection = vc_has_selection(h) != 0
+        case .changed:
+            // A few degrees of wobble in a pinch or a pan are not a twist.
+            if !twistActive {
+                guard abs(degrees) > 12 else { return }
+                twistActive = true
+                twistLast = degrees
+            }
+            let delta = degrees - twistLast
+            twistLast = degrees
+            twistTotal += delta
+            if twistTurnsSelection {
+                onTwist?(twistTotal)
+            } else {
+                // Clockwise on screen, as the finger twist.
+                run("view.rotate", "{\"angle\": \(delta)}")
+            }
+        case .ended:
+            // The selection turns once, at the end: one step in the undo history.
+            if twistActive && twistTurnsSelection && abs(twistTotal) > 0.5 {
+                // The app turns anticlockwise for a positive angle; a clockwise twist is negative.
+                run("object.rotate", "{\"angle\": \(-twistTotal)}")
+            }
+            onTwist?(nil)
+            twistActive = false
+        default:
+            onTwist?(nil)
+            twistActive = false
+        }
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
