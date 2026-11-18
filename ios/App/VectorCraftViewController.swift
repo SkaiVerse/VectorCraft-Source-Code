@@ -1,5 +1,7 @@
 import UIKit
 import UniformTypeIdentifiers
+import PhotosUI
+import Photos
 
 /// Writes a line to VectorCraft-log.txt (visible in Files: On My iPad > VectorCraft).
 func vcLog(_ message: String) {
@@ -15,20 +17,35 @@ func vcLog(_ message: String) {
     }
 }
 
-/// Owns the drawing view and everything that needs Apple's own screens: Files, alerts, printing,
-/// the font picker.
-///
-/// Saving: VectorCraft hands over a finished file and this class shows Apple's Save to Files
-/// sheet. Opening gives the app a copy of the chosen file, so nothing is ever changed behind the
-/// person's back and no duplicates are made.
-final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegate, UIFontPickerViewControllerDelegate {
+/// Owns the drawing view and everything that needs Apple's own screens: Files, Photos, alerts,
+/// printing, the font picker; and the on-screen buttons (Assistive Touch, undo/redo/delete, the
+/// tool arc that opens when the Apple Pencil is squeezed).
+final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegate, UIFontPickerViewControllerDelegate, PHPickerViewControllerDelegate {
 
     private let metal = MetalView()
     private enum Mode { case open, place, save }
     private var mode: Mode = .open
 
+    private let assistive = AssistiveTouchView()
+    private let actionBar = ActionBarView()
+    private var arcMenu: ArcMenuView?
+    private var assistivePlaced = false
+    private var toolBeforeEraser: String?
+
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
+
+    /// The tools of the arc menu, in the order they sit on it.
+    private let arcItems: [ArcMenuView.Item] = [
+        .init(title: "Selection", symbol: "cursorarrow", tools: ["selection"]),
+        .init(title: "Pen", symbol: "pencil.tip", tools: ["pen"]),
+        .init(title: "Shape Builder", symbol: "rectangle.on.rectangle", tools: ["shapeBuilder"]),
+        .init(title: "Type", symbol: "textformat", tools: ["type"]),
+        .init(title: "Direct Select", symbol: "cursorarrow.rays", tools: ["directSelection"]),
+        .init(title: "Eyedropper", symbol: "eyedropper", tools: ["eyedropper", "eyeDropper"]),
+        .init(title: "Eraser", symbol: "eraser", tools: ["eraser"]),
+        .init(title: "Pencil", symbol: "pencil", tools: ["pencil"])
+    ]
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -56,6 +73,25 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         metal.onPasteText = { UIPasteboard.general.string }
         metal.onPrint = { [weak self] title, data in self?.printPDF(title: title, data: data) }
 
+        // Apple Pencil: squeeze opens the tool arc (and the context menu); double tap swaps to
+        // the eraser and back.
+        metal.onPencilSqueeze = { [weak self] point in
+            guard let self = self else { return }
+            self.metal.contextClick(at: point)
+            self.showArcMenu(at: point)
+        }
+        metal.onPencilTap = { [weak self] in self?.swapEraser() }
+        metal.onFingerDrawChanged = { [weak self] on in self?.assistive.setFingerDraw(on) }
+
+        // On-screen buttons.
+        assistive.onMods = { [weak self] bits in self?.metal.stickyMods = bits }
+        assistive.onFingerDraw = { [weak self] on in self?.metal.setFingerDraw(on) }
+        actionBar.onAction = { [weak self] command in self?.metal.run(command) }
+        view.addSubview(actionBar)
+        view.addSubview(assistive)
+        assistive.isHidden = !(UserDefaults.standard.object(forKey: "vcAssistive") as? Bool ?? true)
+        actionBar.isHidden = !(UserDefaults.standard.object(forKey: "vcActionBar") as? Bool ?? true)
+
         let nc = NotificationCenter.default
         nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             self?.metal.saveState()
@@ -69,6 +105,74 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         }
         nc.addObserver(forName: .vcOpenURL, object: nil, queue: .main) { [weak self] note in
             if let url = note.object as? URL { self?.openHandedOver(url) }
+        }
+        nc.addObserver(forName: .vcToggleAssistive, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.assistive.isHidden.toggle()
+            UserDefaults.standard.set(!self.assistive.isHidden, forKey: "vcAssistive")
+        }
+        nc.addObserver(forName: .vcToggleActionBar, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.actionBar.isHidden.toggle()
+            UserDefaults.standard.set(!self.actionBar.isHidden, forKey: "vcActionBar")
+        }
+        nc.addObserver(forName: .vcToggleFingerDraw, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self else { return }
+            self.metal.setFingerDraw(!self.metal.fingerDraw)
+            self.assistive.setFingerDraw(self.metal.fingerDraw)
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let safe = view.safeAreaInsets
+        actionBar.frame.origin = CGPoint(
+            x: safe.left + 14,
+            y: view.bounds.height - safe.bottom - actionBar.bounds.height - 96
+        )
+        if !assistivePlaced && view.bounds.width > 100 {
+            assistive.restorePosition(in: view)
+            assistivePlaced = true
+        }
+    }
+
+    // MARK: Apple Pencil
+
+    private func pickTool(_ ids: [String]) {
+        for id in ids where metal.run("tool.select", "{\"tool\":\"\(id)\"}") { return }
+        vcLog("no tool found for \(ids)")
+    }
+
+    private func showArcMenu(at point: CGPoint) {
+        hideArcMenu()
+        let anchor = metal.convert(point, to: view)
+        let menu = ArcMenuView(frame: view.bounds, anchor: anchor, items: arcItems)
+        menu.onPick = { [weak self] tools in
+            self?.pickTool(tools)
+            self?.hideArcMenu()
+            self?.metal.closeMenus()
+        }
+        menu.onDismiss = { [weak self] in
+            self?.hideArcMenu()
+            self?.metal.closeMenus()
+        }
+        view.insertSubview(menu, belowSubview: assistive)
+        arcMenu = menu
+    }
+
+    private func hideArcMenu() {
+        arcMenu?.removeFromSuperview()
+        arcMenu = nil
+    }
+
+    /// Apple Pencil double tap: the eraser, and back to the tool that was in use.
+    private func swapEraser() {
+        let now = metal.currentTool()
+        if now == "eraser" {
+            if let back = toolBeforeEraser { pickTool([back]) }
+        } else {
+            toolBeforeEraser = now
+            pickTool(["eraser"])
         }
     }
 
@@ -102,7 +206,7 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         metal.suspendFocus = false
     }
 
-    // MARK: Opening and placing files
+    // MARK: Opening and placing: Files or Photos
 
     private func pick(_ m: Mode) {
         vcLog("pick requested: \(m); already presenting: \(presentedViewController != nil)")
@@ -111,12 +215,83 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             return
         }
         mode = m
+        let sheet = UIAlertController(title: nil, message: m == .place ? "Place from" : "Open from", preferredStyle: .actionSheet)
+        sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.showFilesPicker() })
+        sheet.addAction(UIAlertAction(title: "Photos", style: .default) { [weak self] _ in self?.showPhotoPicker() })
+        sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
+            self?.metal.suspendFocus = false
+            if m == .open { self?.metal.cancelOpen() }
+        })
+        centerPopover(sheet)
+        metal.suspendFocus = true
+        present(sheet, animated: true)
+    }
+
+    private func centerPopover(_ sheet: UIAlertController) {
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            pop.permittedArrowDirections = []
+        }
+    }
+
+    private func showFilesPicker() {
         // A copy of the one chosen file: tapping the file returns it straight away.
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
         picker.allowsMultipleSelection = false
         picker.delegate = self
         metal.suspendFocus = true
-        present(picker, animated: true) { vcLog("picker is on screen") }
+        // The action sheet is still closing: present on the next turn.
+        DispatchQueue.main.async { [weak self] in
+            self?.present(picker, animated: true) { vcLog("files picker is on screen") }
+        }
+    }
+
+    private func showPhotoPicker() {
+        var config = PHPickerConfiguration()
+        config.filter = .images
+        config.selectionLimit = (mode == .place) ? 0 : 1
+        config.preferredAssetRepresentationMode = .compatible
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        metal.suspendFocus = true
+        DispatchQueue.main.async { [weak self] in
+            self?.present(picker, animated: true) { vcLog("photos picker is on screen") }
+        }
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        metal.suspendFocus = false
+        let target = mode
+        vcLog("photos picker returned \(results.count) item(s) in mode \(target)")
+        if results.isEmpty {
+            if target == .open { metal.cancelOpen() }
+            return
+        }
+        for r in results {
+            let provider = r.itemProvider
+            guard let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) else {
+                if target == .open { metal.cancelOpen() }
+                continue
+            }
+            provider.loadFileRepresentation(forTypeIdentifier: type) { [weak self] url, error in
+                var payload: (String, Data)?
+                if let url = url, let data = try? Data(contentsOf: url) { payload = (url.lastPathComponent, data) }
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    if let (name, data) = payload {
+                        vcLog("photo \(name), \(data.count) bytes")
+                        if target == .place { self.metal.deliverPlaced(name: name, data: data) }
+                        else { self.metal.deliverOpened(name: name, data: data) }
+                    } else {
+                        vcLog("photo could not be read: \(error?.localizedDescription ?? "unknown")")
+                        if target == .open { self.metal.cancelOpen() }
+                        self.message("Couldn’t read the photo", error?.localizedDescription ?? "")
+                    }
+                }
+            }
+        }
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
@@ -168,15 +343,32 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         read(url) { name, data in self.metal.deliverHandedOver(name: name, data: data) }
     }
 
-    // MARK: Saving
+    // MARK: Saving: Files, and for pictures also Photos
 
-    /// Apple's own Save to Files sheet (Save, Save As, or an export).
     private func handleSave(name: String, data: Data) {
         vcLog("save sheet requested: \(name), \(data.count) bytes")
         guard presentedViewController == nil else {
             message("Not saved", "Another sheet was open, so “\(name)” was not saved. Try again.")
             return
         }
+        let ext = (name as NSString).pathExtension.lowercased()
+        if ["png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "bmp", "webp"].contains(ext) {
+            let sheet = UIAlertController(title: nil, message: "Save “\(name)” to", preferredStyle: .actionSheet)
+            sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.exportToFiles(name: name, data: data) })
+            sheet.addAction(UIAlertAction(title: "Photos", style: .default) { [weak self] _ in self?.saveToPhotos(name: name, data: data) })
+            sheet.addAction(UIAlertAction(title: "Cancel", style: .cancel) { [weak self] _ in
+                self?.metal.suspendFocus = false
+                self?.message("Not saved", "“\(name)” was not saved. VectorCraft may still show it as saved.")
+            })
+            centerPopover(sheet)
+            metal.suspendFocus = true
+            present(sheet, animated: true)
+        } else {
+            exportToFiles(name: name, data: data)
+        }
+    }
+
+    private func exportToFiles(name: String, data: Data) {
         let safe = name.replacingOccurrences(of: "/", with: "_")
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         do {
@@ -187,10 +379,34 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             let picker = UIDocumentPickerViewController(forExporting: [file], asCopy: true)
             picker.delegate = self
             metal.suspendFocus = true
-            present(picker, animated: true)
+            DispatchQueue.main.async { [weak self] in self?.present(picker, animated: true) }
         } catch {
             metal.suspendFocus = false
             message("Couldn’t prepare the file", error.localizedDescription)
+        }
+    }
+
+    private func saveToPhotos(name: String, data: Data) {
+        metal.suspendFocus = false
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard status == .authorized || status == .limited else {
+                    self.message("Couldn’t save to Photos", "Allow VectorCraft to add photos in Settings › Privacy & Security › Photos.")
+                    return
+                }
+                PHPhotoLibrary.shared().performChanges({
+                    let request = PHAssetCreationRequest.forAsset()
+                    let options = PHAssetResourceCreationOptions()
+                    options.originalFilename = name
+                    request.addResource(with: .photo, data: data, options: options)
+                }, completionHandler: { ok, error in
+                    DispatchQueue.main.async {
+                        vcLog("save to Photos: \(ok) \(error?.localizedDescription ?? "")")
+                        self.message(ok ? "Saved to Photos" : "Couldn’t save to Photos", ok ? name : (error?.localizedDescription ?? ""))
+                    }
+                })
+            }
         }
     }
 
