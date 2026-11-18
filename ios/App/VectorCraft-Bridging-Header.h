@@ -47,6 +47,7 @@ void vc_set_finger_draw(void *h, int on);
 void vc_mods(void *h, uint32_t mods);
 int vc_run(void *h, const char *command, const char *params_json);
 const char *vc_tool_id(void *h);
+int vc_has_selection(void *h);
 
 int vc_frame(void *h);
 void vc_save_state(void *h);
