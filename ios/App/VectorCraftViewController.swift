@@ -30,6 +30,7 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     private let actionBar = ActionBarView()
     private var arcMenu: ArcMenuView?
     private var assistivePlaced = false
+    private let twistLabel = UILabel()
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -81,6 +82,16 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         }
         metal.onPencilTap = { [weak self] in self?.cycleTray() }
         metal.onFingerDrawChanged = { [weak self] on in self?.assistive.setFingerDraw(on) }
+        metal.onTwist = { [weak self] degrees in self?.showTwist(degrees) }
+
+        twistLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
+        twistLabel.textColor = .white
+        twistLabel.textAlignment = .center
+        twistLabel.backgroundColor = UIColor(white: 0.12, alpha: 0.92)
+        twistLabel.layer.cornerRadius = 16
+        twistLabel.clipsToBounds = true
+        twistLabel.alpha = 0
+        view.addSubview(twistLabel)
 
         // On-screen buttons.
         assistive.onMods = { [weak self] bits in self?.metal.stickyMods = bits }
@@ -89,7 +100,8 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         view.addSubview(actionBar)
         view.addSubview(assistive)
         assistive.isHidden = !(UserDefaults.standard.object(forKey: "vcAssistive") as? Bool ?? true)
-        actionBar.isHidden = !(UserDefaults.standard.object(forKey: "vcActionBar") as? Bool ?? true)
+        // Undo, redo and delete live in the toolbar now; this floating bar is optional.
+        actionBar.isHidden = !(UserDefaults.standard.object(forKey: "vcActionBar") as? Bool ?? false)
 
         let nc = NotificationCenter.default
         nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
@@ -134,6 +146,19 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             assistive.restorePosition(in: view)
             assistivePlaced = true
         }
+    }
+
+    /// "Rotate 37°" while two fingers turn the selection.
+    private func showTwist(_ degrees: Double?) {
+        guard let d = degrees else {
+            UIView.animate(withDuration: 0.2) { self.twistLabel.alpha = 0 }
+            return
+        }
+        twistLabel.text = String(format: "Rotate %.0f°", -d)
+        twistLabel.sizeToFit()
+        let w = twistLabel.bounds.width + 28
+        twistLabel.frame = CGRect(x: (view.bounds.width - w) / 2, y: view.safeAreaInsets.top + 60, width: w, height: 32)
+        twistLabel.alpha = 1
     }
 
     // MARK: Apple Pencil
