@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use egui::{Event, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
+use serde_json::json;
 use vectorcraft_engine::Session;
 use vectorcraft_ui_egui::place::{PlaceArrival, PlaceInbox};
 use vectorcraft_ui_egui::print::{PrintJob, PrintService, Printer};
@@ -132,6 +133,13 @@ fn hid_to_key(hid: u32) -> Option<egui::Key> {
         0x52 => Key::ArrowUp,
         _ => return None,
     })
+}
+
+/// The tools that select objects or only move the view: a finger may use these directly.
+const SELECTING: [&str; 6] = ["selection", "directSelection", "groupSelection", "magicWand", "lasso", "perspectiveSelection"];
+
+fn is_drawing_tool(id: &str) -> bool {
+    !SELECTING.contains(&id) && !matches!(id, "hand" | "rotateView" | "zoom" | "printTiling")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -315,6 +323,15 @@ struct Host {
     /// The pen is turned to its eraser (Apple Pencil double tap or squeeze).
     eraser: bool,
     wants_keyboard: bool,
+    /// Fingers draw with the current tool (off: a finger selects and moves, whatever the tool).
+    finger_draw: bool,
+    /// The drawing tool to give back once the finger that borrowed the Selection tool lifts.
+    restore_tool: Option<String>,
+    restore_due: bool,
+    /// A finger resting while the pen draws: it holds Shift (constrain proportions).
+    shift_finger: Option<i32>,
+    last_pen_end: Option<Instant>,
+    tool_name: CString,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -390,6 +407,12 @@ impl Host {
             primary_button: None,
             eraser: false,
             wants_keyboard: false,
+            finger_draw: false,
+            restore_tool: None,
+            restore_due: false,
+            shift_finger: None,
+            last_pen_end: None,
+            tool_name: CString::default(),
         })
     }
 
@@ -464,12 +487,15 @@ impl Host {
             2 => TouchPhase::End,
             _ => TouchPhase::Cancel,
         };
+        let mods = self.with_shift(mods);
         if kind == 1 {
             // Apple Pencil.
             let force = Some(pressure.clamp(0.0, 1.0));
             match phase {
                 TouchPhase::Start => {
                     touch::set_source(Source::Pen);
+                    // The pen takes over: drawing with a finger switches itself off.
+                    self.finger_draw = false;
                     self.cancel_fingers(pos, mods);
                     self.pen_sample(pressure, pose);
                     self.pen = Some(id);
@@ -484,6 +510,9 @@ impl Host {
                 TouchPhase::End | TouchPhase::Cancel if self.pen == Some(id) => {
                     self.pen_sample(0.0, PenPose::default());
                     self.pen = None;
+                    self.last_pen_end = Some(Instant::now());
+                    // The pen having been seen would make fingers navigate only: they select and move.
+                    touch::set_pen_seen(false);
                     self.push_touch(PEN_DEVICE, id, phase, pos, None);
                     self.release(pos, mods);
                 }
@@ -494,15 +523,30 @@ impl Host {
             match phase {
                 TouchPhase::Start => {
                     if self.pen.is_some() {
+                        // A second hand on the screen while the pen draws holds Shift, so a
+                        // shape keeps its proportions. (Swift already dropped palms.)
+                        if self.shift_finger.is_none() {
+                            self.shift_finger = Some(id);
+                            let m = self.with_shift(self.modifiers);
+                            self.set_modifiers(m);
+                        }
                         return;
                     }
                     self.fingers.push(id);
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Start, pos, None);
                     if self.primary.is_none() && self.fingers.len() == 1 {
+                        touch::set_pen_seen(false);
                         touch::set_source(Source::Finger);
                         self.stylus.set(None);
+                        self.begin_finger_tool();
                         self.press(id, pos, PointerButton::Primary, mods);
                     }
+                }
+                TouchPhase::End | TouchPhase::Cancel if self.shift_finger == Some(id) => {
+                    self.shift_finger = None;
+                    let mut m = self.modifiers;
+                    m.shift = false;
+                    self.set_modifiers(m);
                 }
                 TouchPhase::Move if self.fingers.contains(&id) => {
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Move, pos, None);
@@ -517,10 +561,37 @@ impl Host {
                         self.release(pos, mods);
                         self.push(Event::PointerGone);
                     }
+                    if self.fingers.is_empty() && self.restore_tool.is_some() {
+                        // Give the drawing tool back once the app has seen the release.
+                        self.restore_due = true;
+                    }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// A finger that lands while a drawing tool is active borrows the Selection tool (to select,
+    /// move and deselect), unless "draw with finger" is on.
+    fn begin_finger_tool(&mut self) {
+        if self.finger_draw || self.restore_tool.is_some() {
+            return;
+        }
+        let tool = self.app.session.tool_id().to_string();
+        if is_drawing_tool(&tool) && self.app.run("tool.select", json!({"tool": "selection"})).is_ok() {
+            self.restore_tool = Some(tool);
+        }
+    }
+
+    fn with_shift(&self, mut m: egui::Modifiers) -> egui::Modifiers {
+        if self.shift_finger.is_some() {
+            m.shift = true;
+        }
+        m
+    }
+
+    fn pen_recent(&self) -> bool {
+        self.pen.is_some() || self.last_pen_end.is_some_and(|t| t.elapsed() < Duration::from_millis(250))
     }
 
     fn handle_output(&self, out: &egui::PlatformOutput) {
@@ -544,7 +615,7 @@ impl Host {
     }
 
     fn flags(&self, drew: bool) -> c_int {
-        (drew as c_int) | ((self.wants_keyboard as c_int) << 1)
+        (drew as c_int) | ((self.wants_keyboard as c_int) << 1) | ((self.finger_draw as c_int) << 2)
     }
 
     fn frame(&mut self) -> c_int {
@@ -572,13 +643,25 @@ impl Host {
             v.inner_rect = Some(rect);
         }
 
+        // Our own Touch Space replaces the built-in Touch workspace: never switch to it by itself.
+        self.app.session.prefs.touch_workspace = false;
+
         let ctx = self.ctx.clone();
         self.app.raw_input_hook(&ctx, &mut raw);
         let logic = ctx.run_logic(&raw, |c| self.app.logic(c));
         let mut full = ctx.run_ui(raw, |ui| self.app.ui(ui));
         self.handle_output(&logic.platform_output);
         self.handle_output(&full.platform_output);
-        self.wants_keyboard = ctx.egui_wants_keyboard_input();
+        // The on-screen keyboard only where text can be typed: a text field, or the Type tool.
+        self.wants_keyboard = full.platform_output.ime.is_some() || logic.platform_output.ime.is_some();
+
+        if self.restore_due {
+            self.restore_due = false;
+            if let Some(tool) = self.restore_tool.take() {
+                let _ = self.app.run("tool.select", json!({"tool": tool}));
+                self.wake();
+            }
+        }
 
         if let Some(vo) = full.viewport_output.get(&egui::ViewportId::ROOT)
             && let Some(at) = Instant::now().checked_add(vo.repaint_delay)
@@ -756,6 +839,11 @@ pub unsafe extern "C" fn vc_pointer_moved(h: *mut c_void, x: f32, y: f32, mods: 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pointer_gone(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
+        // The hover ending while a stroke is being finished would make the app lose the pointer
+        // and close the stroke at its start (a stray line back to where it began).
+        if h.primary.is_some() || h.pen_recent() {
+            return;
+        }
         h.push(Event::PointerGone);
     }
 }
@@ -943,5 +1031,59 @@ pub unsafe extern "C" fn vc_frame(h: *mut c_void) -> c_int {
 pub unsafe extern "C" fn vc_save_state(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
         guard((), || save_prefs(&h.app));
+    }
+}
+
+// --- app controls from Swift's own buttons ---------------------------------------------------
+
+/// Draw with a finger on or off.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_set_finger_draw(h: *mut c_void, on: c_int) {
+    if let Some(h) = unsafe { host(h) } {
+        h.finger_draw = on != 0;
+        h.wake();
+    }
+}
+
+/// Modifier keys held on screen (Assistive Touch): bit 0 Shift, 1 Control, 2 Option, 3 Command.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_mods(h: *mut c_void, mods: u32) {
+    if let Some(h) = unsafe { host(h) } {
+        let m = h.with_shift(to_mods(mods));
+        h.set_modifiers(m);
+    }
+}
+
+/// Run a command of the app, e.g. `edit.undo` or `tool.select` with `{"tool":"pen"}`. 0 when it ran.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_run(h: *mut c_void, command: *const c_char, params_json: *const c_char) -> c_int {
+    guard(1, || {
+        let Some(h) = (unsafe { host(h) }) else { return 1 };
+        let Some(cmd) = (unsafe { from_c(command) }) else { return 1 };
+        let params = unsafe { from_c(params_json) }
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        let r = h.app.run(&cmd, params);
+        h.wake();
+        match r {
+            Ok(_) => 0,
+            Err(e) => {
+                note(&format!("command {cmd} failed: {e}"));
+                1
+            }
+        }
+    })
+}
+
+/// The id of the active tool (e.g. "pen"), valid until the next call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_tool_id(h: *mut c_void) -> *const c_char {
+    match unsafe { host(h) } {
+        Some(h) => {
+            h.tool_name = cstring(h.app.session.tool_id());
+            h.tool_name.as_ptr()
+        }
+        None => std::ptr::null(),
     }
 }
