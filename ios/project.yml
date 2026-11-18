@@ -26,6 +26,7 @@ targets:
         CFBundleDisplayName: VectorCraft
         UILaunchScreen: {}
         UIFileSharingEnabled: true
+        NSPhotoLibraryAddUsageDescription: VectorCraft saves the pictures you export to your Photos library.
         LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: true
