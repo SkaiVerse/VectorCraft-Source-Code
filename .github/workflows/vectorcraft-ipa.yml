@@ -61,6 +61,12 @@ jobs:
               ("if " + MAC + " {\n        dirs.extend([\"/System/Library/Fonts\"",
                "if " + APPLE + " {\n        dirs.extend([\"/System/Library/Fonts\""),
           ])
+          # The built-in Touch workspace is replaced by our own, Touch Space: every tool group in
+          # its tray, and the panels closed to a column of icons until opened.
+          patch("crates/ui-egui/src/workspaces.rs", [
+              ('        w(TOUCH, &|x| {\n            x.control_bar = true;\n            x.toolbar = true;\n            x.toolbar_advanced = true;\n            x.task_bar = true;\n            x.open_panel = Some("align".into());\n        }),\n',
+               '        w("Touch Space", &|x| {\n            x.toolbar = true;\n            x.toolbar_advanced = true;\n            x.dock_collapsed = true;\n            x.open_panel = None;\n        }),\n'),
+          ])
           # The app draws its own tool cursors (as on macOS) instead of asking the system for them.
           patch("crates/ui-egui/src/cursors.rs", [
               ('pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_arch = "wasm32"));',
@@ -84,6 +90,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          set +e
           mkdir -p logs/src
           for f in canvas/view.rs canvas/input.rs canvas/drag.rs prefs_dialog.rs workspaces.rs; do
             if [ -f "crates/ui-egui/src/$f" ]; then cp "crates/ui-egui/src/$f" "logs/src/$(echo $f | tr '/' '_')"; fi
