@@ -3,7 +3,7 @@ import QuartzCore
 
 /// The drawing surface. Catches the pointer, fingers, Apple Pencil, scrolling, pinching and the
 /// keyboard, and hands them to the Rust core.
-final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencilInteractionDelegate {
+final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencilInteractionDelegate, UIPointerInteractionDelegate {
 
     override class var layerClass: AnyClass { CAMetalLayer.self }
     var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
@@ -16,6 +16,19 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     var onCopyText: ((String) -> Void)?
     var onPasteText: (() -> String?)?
     var onPrint: ((String, Data) -> Void)?
+    var onPencilTap: (() -> Void)?
+    var onPencilSqueeze: ((CGPoint) -> Void)?
+    var onFingerDrawChanged: ((Bool) -> Void)?
+    /// Modifier keys held down on screen (Assistive Touch): added to every real one.
+    var stickyMods: UInt32 = 0 {
+        didSet { if let h = handle { vc_mods(h, stickyMods) } }
+    }
+    private(set) var fingerDraw = false
+    /// Where the pencil (or the pointer) last was.
+    private(set) var lastPoint = CGPoint(x: 200, y: 200)
+    /// A touch wider than this (points) is a resting palm, not a fingertip.
+    private let palmRadius: CGFloat = 38
+    private var ignoredTouches = Set<ObjectIdentifier>()
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
@@ -52,6 +65,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         inputAssistantItem.leadingBarButtonGroups = []
         inputAssistantItem.trailingBarButtonGroups = []
         setupGestures()
+        addInteraction(UIPointerInteraction(delegate: self))
         let pencil = UIPencilInteraction()
         pencil.delegate = self
         addInteraction(pencil)
@@ -104,8 +118,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         handle = vc_create(layerPtr, UInt32(bounds.width * s), UInt32(bounds.height * s), Float(s), makeCallbacks())
         if let h = handle {
             pushTheme()
-            // A Pencil has been used on this iPad before: fingers only navigate from the start.
-            if UserDefaults.standard.bool(forKey: "vcPenSeen") { vc_set_pen_seen(h, 1) }
         } else {
             startFailed = true
         }
@@ -124,6 +136,11 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
         let flags = vc_frame(h)
+        let fd = (flags & 4) != 0
+        if fd != fingerDraw {
+            fingerDraw = fd
+            onFingerDrawChanged?(fd)
+        }
         let wants = (flags & 2) != 0
         if wants != softKeyboard {
             softKeyboard = wants
@@ -190,14 +207,54 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     func deliverHandedOver(name: String, data: Data) { deliver(name, data) { vc_drop_file($0, $1, $2, $3) } }
     func cancelOpen() { if let h = handle { vc_open_cancel(h) } }
 
-    // MARK: Apple Pencil double tap and squeeze: the eraser
+    // MARK: Apple Pencil double tap and squeeze
 
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
-        if let h = handle { vc_toggle_eraser(h) }
+        onPencilTap?()
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        if squeeze.phase == .ended, let h = handle { vc_toggle_eraser(h) }
+        guard squeeze.phase == .ended else { return }
+        let p = squeeze.hoverPose?.location ?? lastPoint
+        onPencilSqueeze?(p)
+    }
+
+    // The mouse pointer is hidden: VectorCraft draws its own tool cursors.
+    func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
+        UIPointerStyle.hidden()
+    }
+
+    // MARK: Commands for the on-screen buttons
+
+    func setFingerDraw(_ on: Bool) {
+        fingerDraw = on
+        if let h = handle { vc_set_finger_draw(h, on ? 1 : 0) }
+    }
+
+    @discardableResult
+    func run(_ command: String, _ json: String = "{}") -> Bool {
+        guard let h = handle else { return false }
+        return vc_run(h, command, json) == 0
+    }
+
+    /// Escape: closes an open menu.
+    func closeMenus() {
+        guard let h = handle else { return }
+        vc_key(h, 0x29, 1, 0, 0)
+        vc_key(h, 0x29, 0, 0, 0)
+    }
+
+    func currentTool() -> String {
+        guard let h = handle, let c = vc_tool_id(h) else { return "" }
+        return String(cString: c)
+    }
+
+    /// A secondary click (the context menu) at a point.
+    func contextClick(at p: CGPoint) {
+        guard let h = handle else { return }
+        vc_pointer_moved(h, Float(p.x), Float(p.y), stickyMods)
+        vc_pointer_button(h, Float(p.x), Float(p.y), 1, 1, stickyMods)
+        vc_pointer_button(h, Float(p.x), Float(p.y), 1, 0, stickyMods)
     }
 
     // MARK: Keyboard
@@ -234,7 +291,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if f.contains(.control) { m |= 2 }
         if f.contains(.alternate) { m |= 4 }
         if f.contains(.command) { m |= 8 }
-        return m
+        return m | stickyMods
     }
 
     /// Only real typing keys type text: letters, digits, punctuation, space and the keypad.
@@ -400,6 +457,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         switch g.state {
         case .began, .changed:
             let p = g.location(in: self)
+            lastPoint = p
             vc_pointer_moved(h, Float(p.x), Float(p.y), modBits(g.modifierFlags))
         case .ended, .cancelled:
             vc_pointer_gone(h)
@@ -434,6 +492,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         let s = touch ?? t
         let p = s.location(in: self)
+        if t.type == .pencil { lastPoint = p }
         let mods = modBits(event?.modifierFlags ?? [])
         let id = touchID(t)
         if t.type == .pencil {
@@ -468,9 +527,13 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 vc_pointer_moved(h, Float(p.x), Float(p.y), mods)
                 vc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 1, mods)
             case .pencil:
-                if !UserDefaults.standard.bool(forKey: "vcPenSeen") { UserDefaults.standard.set(true, forKey: "vcPenSeen") }
                 send(t, phase: 0, event: event)
             case .direct:
+                // A palm is much wider than a fingertip: ignore it.
+                if t.majorRadius > palmRadius {
+                    ignoredTouches.insert(ObjectIdentifier(t))
+                    continue
+                }
                 fingersDown += 1
                 send(t, phase: 0, event: event)
             default:
@@ -493,6 +556,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 let samples = event?.coalescedTouches(for: t) ?? [t]
                 for c in samples { send(t, phase: 1, at: c, event: event) }
             case .direct:
+                if ignoredTouches.contains(ObjectIdentifier(t)) { continue }
                 send(t, phase: 1, event: event)
             default:
                 break
@@ -512,6 +576,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 send(t, phase: cancelled ? 3 : 2, event: event)
                 touchIDs[ObjectIdentifier(t)] = nil
             case .direct:
+                if ignoredTouches.remove(ObjectIdentifier(t)) != nil { continue }
                 fingersDown = max(0, fingersDown - 1)
                 send(t, phase: cancelled ? 3 : 2, event: event)
                 touchIDs[ObjectIdentifier(t)] = nil
