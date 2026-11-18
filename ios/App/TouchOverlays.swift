@@ -1,20 +1,12 @@
 import UIKit
 
 private let panelColor = UIColor(white: 0.13, alpha: 0.94)
-private let borderColor = UIColor(white: 1, alpha: 0.18)
-
-private func styled(_ b: UIButton, size: CGFloat) {
-    b.backgroundColor = panelColor
-    b.layer.cornerRadius = size / 2
-    b.layer.borderWidth = 1
-    b.layer.borderColor = borderColor.cgColor
-    b.tintColor = .white
-    b.setTitleColor(.white, for: .normal)
-}
+private let borderColor = UIColor(white: 1, alpha: 0.16)
 
 // MARK: - Arc tool menu (Apple Pencil squeeze)
 
-/// A strip of tools curving round the point where the pencil was squeezed.
+/// A slim strip of tools curving over the point where the pencil was squeezed. The strip is one
+/// colour; the tool under the pencil (hovering) or finger gets a circle around it and its name.
 final class ArcMenuView: UIView {
     struct Item {
         let title: String
@@ -28,6 +20,14 @@ final class ArcMenuView: UIView {
 
     private let items: [Item]
     private let anchor: CGPoint
+    private var buttons: [UIButton] = []
+    private var rings: [UIView] = []
+    private let label = UILabel()
+    private let labelPill = UIView()
+
+    private let radius: CGFloat = 104
+    private let iconSize: CGFloat = 42
+    private let thickness: CGFloat = 60
 
     init(frame: CGRect, anchor: CGPoint, items: [Item]) {
         self.items = items
@@ -41,54 +41,95 @@ final class ArcMenuView: UIView {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     private func build() {
-        let radius: CGFloat = 170
-        let above = anchor.y > 260
-        let from: CGFloat = above ? CGFloat.pi + 0.32 : 0.32
-        let to: CGFloat = above ? 2 * CGFloat.pi - 0.32 : CGFloat.pi - 0.32
+        let above = anchor.y > 230
+        // The strip sweeps 190 degrees, centred straight up (or straight down).
+        let centre: CGFloat = above ? -CGFloat.pi / 2 : CGFloat.pi / 2
+        let half: CGFloat = 95 * CGFloat.pi / 180
+        let start = centre - half
+        let end = centre + half
 
-        // The strip behind the buttons.
         let strip = CAShapeLayer()
-        strip.path = UIBezierPath(arcCenter: anchor, radius: radius, startAngle: from - 0.12, endAngle: to + 0.12, clockwise: true).cgPath
-        strip.strokeColor = UIColor(white: 0.1, alpha: 0.88).cgColor
+        strip.path = UIBezierPath(arcCenter: anchor, radius: radius, startAngle: start, endAngle: end, clockwise: true).cgPath
+        strip.strokeColor = UIColor(white: 0.15, alpha: 0.97).cgColor
         strip.fillColor = UIColor.clear.cgColor
-        strip.lineWidth = 92
+        strip.lineWidth = thickness
         strip.lineCap = .round
+        strip.shadowColor = UIColor.black.cgColor
+        strip.shadowOpacity = 0.35
+        strip.shadowRadius = 10
+        strip.shadowOffset = CGSize(width: 0, height: 3)
         layer.addSublayer(strip)
 
         let count = items.count
         for (i, item) in items.enumerated() {
             let t = count > 1 ? CGFloat(i) / CGFloat(count - 1) : 0.5
-            let angle = from + (to - from) * t
+            let angle = start + (end - start) * t
             var c = CGPoint(x: anchor.x + radius * cos(angle), y: anchor.y + radius * sin(angle))
-            c.x = min(max(c.x, 48), bounds.width - 48)
-            c.y = min(max(c.y, 48), bounds.height - 48)
+            c.x = min(max(c.x, 30), bounds.width - 30)
+            c.y = min(max(c.y, 30), bounds.height - 30)
 
-            var config = UIButton.Configuration.filled()
-            config.image = UIImage(systemName: item.symbol)
-            config.title = item.title
-            config.imagePlacement = .top
-            config.imagePadding = 3
-            config.baseBackgroundColor = UIColor(white: 0.25, alpha: 1)
-            config.baseForegroundColor = .white
-            config.cornerStyle = .large
-            config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 4, bottom: 6, trailing: 4)
-            config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { a in
-                var a = a
-                a.font = UIFont.systemFont(ofSize: 10, weight: .medium)
-                return a
-            }
-            let b = UIButton(configuration: config)
-            b.frame = CGRect(x: 0, y: 0, width: 72, height: 66)
+            // The circle that shows which tool the pencil is over.
+            let ring = UIView(frame: CGRect(x: 0, y: 0, width: iconSize, height: iconSize))
+            ring.center = c
+            ring.layer.cornerRadius = iconSize / 2
+            ring.backgroundColor = UIColor(white: 1, alpha: 0.12)
+            ring.layer.borderWidth = 2
+            ring.layer.borderColor = UIColor.systemBlue.cgColor
+            ring.alpha = 0
+            ring.isUserInteractionEnabled = false
+            addSubview(ring)
+            rings.append(ring)
+
+            let b = UIButton(type: .custom)
+            b.frame = CGRect(x: 0, y: 0, width: iconSize, height: iconSize)
             b.center = c
+            b.setImage(UIImage(systemName: item.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 19, weight: .regular)), for: .normal)
+            b.tintColor = .white
             b.tag = i
+            b.addTarget(self, action: #selector(down(_:)), for: .touchDown)
+            b.addTarget(self, action: #selector(up(_:)), for: [.touchUpOutside, .touchCancel])
             b.addTarget(self, action: #selector(picked(_:)), for: .touchUpInside)
+            b.addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hovered(_:))))
             addSubview(b)
+            buttons.append(b)
+        }
+
+        // The tool's name, just outside the strip.
+        labelPill.backgroundColor = UIColor(white: 0.15, alpha: 0.97)
+        labelPill.layer.cornerRadius = 13
+        labelPill.alpha = 0
+        label.textColor = .white
+        label.font = UIFont.systemFont(ofSize: 13, weight: .medium)
+        label.textAlignment = .center
+        labelPill.addSubview(label)
+        addSubview(labelPill)
+    }
+
+    private func show(_ i: Int?) {
+        for (k, ring) in rings.enumerated() { ring.alpha = (k == i) ? 1 : 0 }
+        guard let i = i else { labelPill.alpha = 0; return }
+        label.text = items[i].title
+        label.sizeToFit()
+        let w = label.bounds.width + 24
+        labelPill.bounds = CGRect(x: 0, y: 0, width: w, height: 26)
+        label.frame = labelPill.bounds
+        let above = anchor.y > 230
+        let y = above ? anchor.y - radius - thickness / 2 - 24 : anchor.y + radius + thickness / 2 + 24
+        labelPill.center = CGPoint(x: min(max(anchor.x, w / 2 + 8), bounds.width - w / 2 - 8), y: min(max(y, 20), bounds.height - 20))
+        labelPill.alpha = 1
+    }
+
+    @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+        guard let b = g.view else { return }
+        switch g.state {
+        case .began, .changed: show(b.tag)
+        default: show(nil)
         }
     }
 
-    @objc private func picked(_ b: UIButton) {
-        onPick?(items[b.tag].tools)
-    }
+    @objc private func down(_ b: UIButton) { show(b.tag) }
+    @objc private func up(_ b: UIButton) { show(nil) }
+    @objc private func picked(_ b: UIButton) { onPick?(items[b.tag].tools) }
 
     // A tap anywhere else closes the menu.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -98,71 +139,103 @@ final class ArcMenuView: UIView {
 
 // MARK: - Assistive Touch (modifier keys on screen)
 
-/// A round button you can drag anywhere. Tap it to open a ring of Shift, Control, Option and
-/// Command; each one latches (several at once), as on a keyboard. A hand button switches
-/// "draw with finger" on and off.
+/// A round button you can drag anywhere. Tap it and a ring of four keys opens round it: Shift
+/// (top), Command (right), Option (bottom) and Control (left). Each key latches; several can be on
+/// at once, as when holding them on a keyboard. A small hand switches "draw with finger".
 final class AssistiveTouchView: UIView {
     var onMods: ((UInt32) -> Void)?
     var onFingerDraw: ((Bool) -> Void)?
 
     private let main = UIButton(type: .custom)
     private let hand = UIButton(type: .custom)
-    private var keyButtons: [UIButton] = []
-    private let keyBits: [UInt32] = [1, 2, 8, 4]
-    private let keyGlyphs = ["⇧", "⌃", "⌘", "⌥"]
-    private let keyOffsets: [CGPoint] = [CGPoint(x: 0, y: -72), CGPoint(x: -72, y: 0), CGPoint(x: 72, y: 0), CGPoint(x: 0, y: 72)]
+    private let ringLayer = CALayer()
+    private var wedges: [CAShapeLayer] = []
+    private var wedgePaths: [UIBezierPath] = []
+    private var glyphs: [UILabel] = []
+
+    // top, right, bottom, left
+    private let bits: [UInt32] = [1, 8, 4, 2]
+    private let marks = ["⇧", "⌘", "⌥", "⌃"]
+    private let mids: [CGFloat] = [-CGFloat.pi / 2, 0, CGFloat.pi / 2, CGFloat.pi]
+
     private var expanded = false
     private var active: UInt32 = 0
     private(set) var fingerDrawOn = false
 
+    private let off = UIColor(red: 0.10, green: 0.20, blue: 0.28, alpha: 0.82)
+    private let on = UIColor(red: 0.12, green: 0.62, blue: 0.95, alpha: 0.96)
+
     init() {
-        super.init(frame: CGRect(x: 0, y: 0, width: 230, height: 230))
+        super.init(frame: CGRect(x: 0, y: 0, width: 224, height: 224))
         backgroundColor = .clear
+        let c = CGPoint(x: bounds.midX, y: bounds.midY)
 
-        main.frame = CGRect(x: 0, y: 0, width: 58, height: 58)
-        main.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        styled(main, size: 58)
-        main.backgroundColor = UIColor(white: 0.35, alpha: 0.92)
-        main.layer.borderWidth = 5
-        main.layer.borderColor = UIColor(white: 0.85, alpha: 0.9).cgColor
-        main.addTarget(self, action: #selector(toggleRing), for: .touchUpInside)
-        main.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragged(_:))))
+        ringLayer.frame = bounds
+        ringLayer.opacity = 0
+        layer.addSublayer(ringLayer)
 
-        for (i, glyph) in keyGlyphs.enumerated() {
-            let b = UIButton(type: .custom)
-            b.frame = CGRect(x: 0, y: 0, width: 54, height: 54)
-            b.center = CGPoint(x: bounds.midX + keyOffsets[i].x, y: bounds.midY + keyOffsets[i].y)
-            styled(b, size: 54)
-            b.setTitle(glyph, for: .normal)
-            b.titleLabel?.font = UIFont.systemFont(ofSize: 26, weight: .semibold)
-            b.tag = i
-            b.alpha = 0
-            b.isHidden = true
-            b.addTarget(self, action: #selector(keyTapped(_:)), for: .touchUpInside)
-            addSubview(b)
-            keyButtons.append(b)
+        for i in 0..<4 {
+            let path = wedge(center: c, inner: 38, outer: 88, mid: mids[i], half: 40 * CGFloat.pi / 180)
+            wedgePaths.append(path)
+            let shape = CAShapeLayer()
+            shape.path = path.cgPath
+            shape.fillColor = off.cgColor
+            ringLayer.addSublayer(shape)
+            wedges.append(shape)
+
+            let g = UILabel()
+            g.text = marks[i]
+            g.font = UIFont.systemFont(ofSize: 24, weight: .semibold)
+            g.textColor = UIColor(white: 0.85, alpha: 0.9)
+            g.sizeToFit()
+            g.center = CGPoint(x: c.x + 63 * cos(mids[i]), y: c.y + 63 * sin(mids[i]))
+            g.isUserInteractionEnabled = false
+            g.alpha = 0
+            addSubview(g)
+            glyphs.append(g)
         }
 
-        hand.frame = CGRect(x: 0, y: 0, width: 54, height: 54)
-        hand.center = CGPoint(x: bounds.midX + 64, y: bounds.midY - 64)
-        styled(hand, size: 54)
+        main.frame = CGRect(x: 0, y: 0, width: 58, height: 58)
+        main.center = c
+        main.backgroundColor = UIColor(white: 0.40, alpha: 0.60)
+        main.layer.cornerRadius = 29
+        main.layer.borderWidth = 5
+        main.layer.borderColor = UIColor(white: 0.9, alpha: 0.92).cgColor
+        main.addTarget(self, action: #selector(toggleRing), for: .touchUpInside)
+        main.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragged(_:))))
+        addSubview(main)
+
+        hand.frame = CGRect(x: 0, y: 0, width: 40, height: 40)
+        hand.center = CGPoint(x: c.x + 82, y: c.y - 82)
+        hand.backgroundColor = panelColor
+        hand.layer.cornerRadius = 20
+        hand.layer.borderWidth = 1
+        hand.layer.borderColor = borderColor.cgColor
+        hand.tintColor = .white
         hand.setImage(UIImage(systemName: "hand.point.up.left.fill"), for: .normal)
         hand.alpha = 0
         hand.isHidden = true
         hand.addTarget(self, action: #selector(handTapped), for: .touchUpInside)
         addSubview(hand)
 
-        addSubview(main)
+        addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    /// Only the buttons take touches; the rest of the square lets them through to the canvas.
+    private func wedge(center: CGPoint, inner: CGFloat, outer: CGFloat, mid: CGFloat, half: CGFloat) -> UIBezierPath {
+        let p = UIBezierPath()
+        p.addArc(withCenter: center, radius: outer, startAngle: mid - half, endAngle: mid + half, clockwise: true)
+        p.addArc(withCenter: center, radius: inner, startAngle: mid + half, endAngle: mid - half, clockwise: false)
+        p.close()
+        return p
+    }
+
+    /// Only the buttons and the ring take touches; the rest lets them through to the canvas.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        for v in subviews.reversed() where !v.isHidden && v.alpha > 0.05 {
-            let p = v.convert(point, from: self)
-            if v.point(inside: p, with: event) { return v.hitTest(p, with: event) ?? v }
-        }
+        if !hand.isHidden, hand.frame.contains(point) { return hand }
+        if main.frame.contains(point) { return main }
+        if expanded, wedgePaths.contains(where: { $0.contains(point) }) { return self }
         return nil
     }
 
@@ -171,33 +244,34 @@ final class AssistiveTouchView: UIView {
         hand.backgroundColor = on ? UIColor.systemBlue : panelColor
     }
 
-    /// Releases every latched key (after a gesture used them).
-    func clearKeys() {
-        active = 0
-        refresh()
-        onMods?(0)
-    }
-
     private func refresh() {
-        for (i, b) in keyButtons.enumerated() {
-            b.backgroundColor = (active & keyBits[i]) != 0 ? UIColor.systemBlue : panelColor
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, w) in wedges.enumerated() {
+            w.fillColor = ((active & bits[i]) != 0 ? on : off).cgColor
+            glyphs[i].textColor = (active & bits[i]) != 0 ? .white : UIColor(white: 0.85, alpha: 0.9)
         }
-        main.backgroundColor = active != 0 ? UIColor.systemBlue.withAlphaComponent(0.8) : UIColor(white: 0.35, alpha: 0.92)
+        CATransaction.commit()
+        main.backgroundColor = active != 0 ? UIColor.systemBlue.withAlphaComponent(0.55) : UIColor(white: 0.40, alpha: 0.60)
     }
 
     @objc private func toggleRing() {
         expanded.toggle()
-        let shown = keyButtons + [hand]
-        if expanded { shown.forEach { $0.isHidden = false } }
-        UIView.animate(withDuration: 0.18, animations: {
-            shown.forEach { $0.alpha = self.expanded ? 1 : 0 }
+        if expanded { hand.isHidden = false }
+        UIView.animate(withDuration: 0.16, animations: {
+            self.ringLayer.opacity = self.expanded ? 1 : 0
+            self.glyphs.forEach { $0.alpha = self.expanded ? 1 : 0 }
+            self.hand.alpha = self.expanded ? 1 : 0
         }, completion: { _ in
-            if !self.expanded { shown.forEach { $0.isHidden = true } }
+            if !self.expanded { self.hand.isHidden = true }
         })
     }
 
-    @objc private func keyTapped(_ b: UIButton) {
-        active ^= keyBits[b.tag]
+    @objc private func tapped(_ g: UITapGestureRecognizer) {
+        guard expanded else { return }
+        let p = g.location(in: self)
+        guard let i = wedgePaths.firstIndex(where: { $0.contains(p) }) else { return }
+        active ^= bits[i]
         refresh()
         onMods?(active)
     }
@@ -223,7 +297,7 @@ final class AssistiveTouchView: UIView {
     /// Puts the button where it was last left (or at the right edge).
     func restorePosition(in container: UIView) {
         let saved = UserDefaults.standard.array(forKey: "vcAssistivePos") as? [Double]
-        let fx = saved?.first ?? 0.94
+        let fx = saved?.first ?? 0.93
         let fy = saved?.last ?? 0.55
         center = CGPoint(x: container.bounds.width * CGFloat(fx), y: container.bounds.height * CGFloat(fy))
     }
@@ -231,7 +305,7 @@ final class AssistiveTouchView: UIView {
 
 // MARK: - Undo, redo and delete
 
-/// A slim bar of the three buttons a finger needs most.
+/// A slim bar with the three buttons a finger needs most.
 final class ActionBarView: UIView {
     var onAction: ((String) -> Void)?
 
@@ -242,15 +316,15 @@ final class ActionBarView: UIView {
     ]
 
     init() {
-        super.init(frame: CGRect(x: 0, y: 0, width: 60, height: 3 * 56 + 16))
+        super.init(frame: CGRect(x: 0, y: 0, width: 44, height: 3 * 40 + 8))
         backgroundColor = panelColor
-        layer.cornerRadius = 30
+        layer.cornerRadius = 22
         layer.borderWidth = 1
         layer.borderColor = borderColor.cgColor
         for (i, a) in actions.enumerated() {
             let b = UIButton(type: .custom)
-            b.frame = CGRect(x: 4, y: 8 + CGFloat(i) * 56, width: 52, height: 52)
-            b.setImage(UIImage(systemName: a.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)), for: .normal)
+            b.frame = CGRect(x: 2, y: 4 + CGFloat(i) * 40, width: 40, height: 40)
+            b.setImage(UIImage(systemName: a.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)), for: .normal)
             b.tintColor = .white
             b.tag = i
             b.addTarget(self, action: #selector(tapped(_:)), for: .touchUpInside)
