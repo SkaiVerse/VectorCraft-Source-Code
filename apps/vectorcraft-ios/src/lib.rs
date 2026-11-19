@@ -61,6 +61,24 @@ fn note(msg: &str) {
     }
 }
 
+/// Documents/Recents holds a copy of every file that was opened or saved, so File > Open Recent
+/// can read it again (the iPad gives the app a copy of a file, not its place in Files).
+fn recent_copy(path: &str) -> Option<PathBuf> {
+    let name = std::path::Path::new(path).file_name()?;
+    let copy = documents_dir()?.join("Recents").join(name);
+    copy.is_file().then_some(copy)
+}
+
+fn read_recent(path: &str) -> Result<Vec<u8>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(first) => match recent_copy(path) {
+            Some(copy) => std::fs::read(copy).map_err(|e| e.to_string()),
+            None => Err(first.to_string()),
+        },
+    }
+}
+
 fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
@@ -274,6 +292,9 @@ fn build_services(cb: VCCallbacks, picked: &PickedInbox, dropped: &Inbox, place:
             unsafe { f(cb.user, n.as_ptr(), bytes.as_ptr(), bytes.len()) };
             Ok(())
         })),
+        // Open Recent: the file is read from where it was opened or saved, or from Recents.
+        read: Some(Box::new(read_recent)),
+        exists: Some(std::sync::Arc::new(|p: &str| std::path::Path::new(p).exists() || recent_copy(p).is_some())),
         inbox: Some(dropped.clone()),
         picked_inbox: Some(picked.clone()),
         place_inbox: Some(place.clone()),
@@ -1364,7 +1385,8 @@ pub unsafe extern "C" fn vc_has_selection(h: *mut c_void) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_theme_color(h: *mut c_void, which: c_int) -> u32 {
     let Some(h) = (unsafe { host(h) }) else { return 0x2020_20FF };
-    let v = h.ctx.style().visuals.clone();
+    // This egui has no plain `style()`: the style of the theme in use is asked for.
+    let v = h.ctx.style_of(h.ctx.theme()).visuals.clone();
     let c = match which {
         0 => v.panel_fill,
         1 => v.window_fill,
