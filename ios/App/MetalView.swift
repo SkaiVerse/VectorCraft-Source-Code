@@ -29,12 +29,14 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     /// Where the pencil (or the pointer) last was.
     private(set) var lastPoint = CGPoint(x: 200, y: 200)
     /// A touch wider than this (points) is a resting palm, not a fingertip.
-    private let palmRadius: CGFloat = 38
+    private let palmRadius: CGFloat = 42
     private var ignoredTouches = Set<ObjectIdentifier>()
     private var twistLast = 0.0
     private var twistTotal = 0.0
     private var twistActive = false
     private var twistTurnsSelection = false
+    private var twistApplied = false
+    private var twistShown = 0.0
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
@@ -248,6 +250,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         guard let h = handle else { return }
         vc_key(h, 0x29, 1, 0, 0)
         vc_key(h, 0x29, 0, 0, 0)
+    }
+
+    /// One of the app's own colours, so what is drawn over it follows its theme.
+    /// 0 panel, 1 window (menus), 2 text, 3 accent.
+    func themeColor(_ which: Int32) -> UIColor {
+        guard let h = handle else { return UIColor(white: 0.15, alpha: 1) }
+        let v = vc_theme_color(h, which)
+        return UIColor(red: CGFloat((v >> 24) & 255) / 255, green: CGFloat((v >> 16) & 255) / 255,
+                       blue: CGFloat((v >> 8) & 255) / 255, alpha: CGFloat(v & 255) / 255)
     }
 
     func currentTool() -> String {
@@ -492,13 +503,15 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         switch g.state {
         case .began:
             twistActive = false
+            twistApplied = false
             twistTotal = 0
             twistLast = 0
+            twistShown = 0
             twistTurnsSelection = vc_has_selection(h) != 0
         case .changed:
-            // A few degrees of wobble in a pinch or a pan are not a twist.
+            // Only a clear twist counts: a pinch or a pan wobbles a few degrees.
             if !twistActive {
-                guard abs(degrees) > 12 else { return }
+                guard abs(degrees) > 25, fingersDown == 2 else { return }
                 twistActive = true
                 twistLast = degrees
             }
@@ -506,22 +519,28 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             twistLast = degrees
             twistTotal += delta
             if twistTurnsSelection {
+                // A live preview: the selection is turned to the twist so far, each time in place
+                // of the last turn, so the undo history ends up with one step.
+                guard abs(twistTotal - twistShown) >= 0.5 else { return }
+                if twistApplied { run("edit.undo") }
+                // The app turns anticlockwise for a positive angle; a clockwise twist is negative.
+                twistApplied = run("object.rotate", "{\"angle\": \(-twistTotal)}")
+                twistShown = twistTotal
                 onTwist?(twistTotal)
             } else {
                 // Clockwise on screen, as the finger twist.
                 run("view.rotate", "{\"angle\": \(delta)}")
             }
         case .ended:
-            // The selection turns once, at the end: one step in the undo history.
-            if twistActive && twistTurnsSelection && abs(twistTotal) > 0.5 {
-                // The app turns anticlockwise for a positive angle; a clockwise twist is negative.
-                run("object.rotate", "{\"angle\": \(-twistTotal)}")
-            }
             onTwist?(nil)
             twistActive = false
+            twistApplied = false
         default:
+            // The gesture was interrupted: the preview is taken back.
+            if twistApplied { run("edit.undo") }
             onTwist?(nil)
             twistActive = false
+            twistApplied = false
         }
     }
 
