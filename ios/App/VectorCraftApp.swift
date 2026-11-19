@@ -15,7 +15,10 @@ struct VectorCraftApp: App {
             ZStack {
                 Color(red: 0.11, green: 0.11, blue: 0.12).ignoresSafeArea()
                 VectorCraftHost()
+                    // The on-screen keyboard floats over the app; it never resizes or shifts it.
+                    .ignoresSafeArea(.keyboard, edges: .bottom)
             }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
             .statusBarHidden(true)
             // "Open in VectorCraft" from Files or another app.
             .onOpenURL { url in
