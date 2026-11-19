@@ -142,8 +142,17 @@ fn is_drawing_tool(id: &str) -> bool {
     !SELECTING.contains(&id) && !matches!(id, "hand" | "rotateView" | "zoom" | "printTiling" | "eyedropper")
 }
 
-/// How long a press must stay still to count as "press and hold".
-const HOLD: Duration = Duration::from_millis(450);
+/// How long a press must stay still to count as "press and hold". Shorter than the context
+/// menu's long press (made longer while a pen or finger is down), so the two never mix.
+const HOLD: Duration = Duration::from_millis(300);
+
+/// A lone finger waits this long before it acts, so a thumb landing just after it makes a
+/// two-finger gesture (zoom, pan, twist) and not a selection.
+const SETTLE: Duration = Duration::from_millis(90);
+
+/// How far (points) a finger or the pen must travel before a selection tool moves anything.
+const FINGER_DEAD_ZONE: f32 = 14.0;
+const PEN_DEAD_ZONE: f32 = 7.0;
 
 /// A press that waits before the app sees it.
 #[derive(Clone, Copy, PartialEq)]
@@ -162,6 +171,22 @@ struct Gate {
     kind: GateKind,
     started: Instant,
     origin: Pos2,
+}
+
+/// A lone finger's press, waiting to see whether a second finger joins it.
+#[derive(Clone, Copy)]
+struct Settle {
+    id: i32,
+    pos: Pos2,
+    mods: egui::Modifiers,
+    started: Instant,
+}
+
+/// A press with a selection tool that has to travel a way before anything moves.
+#[derive(Clone, Copy)]
+struct DeadZone {
+    origin: Pos2,
+    radius: f32,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -358,6 +383,10 @@ struct Host {
     deferred: Vec<egui::Event>,
     /// Option is held by a press-and-hold (the Pen tool's corner conversion).
     hold_alt: bool,
+    /// After a press-and-hold went through, the press does not drag until it is lifted.
+    hold_lock: bool,
+    settle: Option<Settle>,
+    dead: Option<DeadZone>,
 }
 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
@@ -448,6 +477,9 @@ impl Host {
             gate: None,
             deferred: Vec::new(),
             hold_alt: false,
+            hold_lock: false,
+            settle: None,
+            dead: None,
         })
     }
 
@@ -536,6 +568,8 @@ impl Host {
 
     fn release(&mut self, pos: Pos2, mods: egui::Modifiers) {
         self.primary = None;
+        self.dead = None;
+        self.hold_lock = false;
         if let Some(button) = self.primary_button.take() {
             self.push(Event::ModifiersChanged(mods));
             self.modifiers = mods;
@@ -574,6 +608,9 @@ impl Host {
             _ => TouchPhase::Cancel,
         };
         let mods = self.with_shift(mods);
+        // The pressing contact's position, with the selection tools' dead zone taken off.
+        let pressing = if kind == 1 { self.pen == Some(id) } else { self.primary == Some(id) };
+        let pos = if pressing && phase != TouchPhase::Start { self.dead_pos(pos) } else { pos };
         if kind == 1 {
             // Apple Pencil.
             let force = Some(pressure.clamp(0.0, 1.0));
@@ -590,6 +627,11 @@ impl Host {
                     self.pen = Some(id);
                     self.push_touch(PEN_DEVICE, id, TouchPhase::Start, pos, force);
                     self.press(id, pos, PointerButton::Primary, mods);
+                    self.arm_dead_zone(pos, PEN_DEAD_ZONE);
+                }
+                TouchPhase::Move if self.pen == Some(id) && self.hold_lock => {
+                    // Held to change the point: dragging has to wait for a new press.
+                    self.pen_sample(pressure, pose);
                 }
                 TouchPhase::Move if self.pen == Some(id) => {
                     self.leave_gate_on_move(pos);
@@ -623,19 +665,26 @@ impl Host {
                         }
                         return;
                     }
+                    // A second finger while the first still waits: a gesture (zoom, pan, twist),
+                    // so neither finger presses anything.
+                    let second = self.settle.take().is_some();
                     self.fingers.push(id);
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Start, pos, None);
-                    if self.primary.is_none() && self.fingers.len() == 1 {
+                    if !second && self.primary.is_none() && self.fingers.len() == 1 {
                         touch::set_pen_seen(false);
                         touch::set_source(Source::Finger);
                         self.stylus.set(None);
-                        self.begin_finger_tool();
                         let tool = self.app.session.tool_id().to_string();
                         if self.finger_draw || tool == "eyedropper" {
+                            self.begin_finger_tool();
                             self.push(Event::PointerMoved(pos));
                             self.begin_gate(pos, true);
+                            self.press(id, pos, PointerButton::Primary, mods);
+                        } else {
+                            // Selecting, moving, tapping away: after a short wait for company.
+                            self.settle = Some(Settle { id, pos, mods, started: Instant::now() });
+                            wake_at(&self.deadline, Instant::now() + SETTLE);
                         }
-                        self.press(id, pos, PointerButton::Primary, mods);
                     }
                 }
                 TouchPhase::End | TouchPhase::Cancel if self.shift_finger == Some(id) => {
@@ -645,6 +694,9 @@ impl Host {
                     self.set_modifiers(m);
                 }
                 TouchPhase::Move if self.fingers.contains(&id) => {
+                    if self.settle.is_some_and(|s| s.id == id && (pos - s.pos).length() > 10.0) {
+                        self.flush_settle();
+                    }
                     self.leave_gate_on_move(pos);
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Move, pos, None);
                     if self.primary == Some(id) {
@@ -652,6 +704,13 @@ impl Host {
                     }
                 }
                 TouchPhase::End | TouchPhase::Cancel if self.fingers.contains(&id) => {
+                    if self.settle.is_some_and(|s| s.id == id) {
+                        if phase == TouchPhase::End {
+                            self.flush_settle();
+                        } else {
+                            self.settle = None;
+                        }
+                    }
                     self.fingers.retain(|f| *f != id);
                     self.push_touch(FINGER_DEVICE, id, phase, pos, None);
                     if self.primary == Some(id) {
@@ -681,20 +740,57 @@ impl Host {
         }
     }
 
+    /// The settled finger press: borrow the Selection tool if a drawing tool is active, and press.
+    fn flush_settle(&mut self) {
+        if let Some(s) = self.settle.take() {
+            self.begin_finger_tool();
+            self.press(s.id, s.pos, PointerButton::Primary, s.mods);
+            self.arm_dead_zone(s.pos, FINGER_DEAD_ZONE);
+        }
+    }
+
+    /// Selection tools (and the like) take a press that must travel a way before they move.
+    fn arm_dead_zone(&mut self, pos: Pos2, radius: f32) {
+        let tool = self.app.session.tool_id().to_string();
+        self.dead = SELECTING.contains(&tool.as_str()).then_some(DeadZone { origin: pos, radius });
+    }
+
+    /// The position the app sees for the pressing contact, with the dead zone taken off.
+    fn dead_pos(&self, pos: Pos2) -> Pos2 {
+        match self.dead {
+            Some(d) => {
+                let delta = pos - d.origin;
+                let len = delta.length();
+                if len <= d.radius {
+                    d.origin
+                } else {
+                    d.origin + delta * ((len - d.radius) / len)
+                }
+            }
+            None => pos,
+        }
+    }
+
     /// A held press that moves is a drag: it goes through as it is.
     fn leave_gate_on_move(&mut self, pos: Pos2) {
-        if let Some(g) = self.gate
-            && g.kind != GateKind::Frame
-            && (pos - g.origin).length() > 8.0
-        {
-            self.flush_gate(false);
+        if let Some(g) = self.gate {
+            let slop = match g.kind {
+                GateKind::Frame => return,
+                // The Pen tool drags handles out at once.
+                GateKind::PenHold => 3.0,
+                GateKind::Eyedropper => 10.0,
+            };
+            if (pos - g.origin).length() > slop {
+                self.flush_gate(false);
+            }
         }
     }
 
     /// The press lifted while held back: the tap goes through (an eyedropper tap applies).
-    fn end_gate_on_lift(&mut self, completed: bool) {
-        if let Some(g) = self.gate {
-            self.flush_gate(completed && g.kind == GateKind::Eyedropper);
+    fn end_gate_on_lift(&mut self, _completed: bool) {
+        // A tap goes through as a plain click: the eyedropper picks, the pen places a point.
+        if self.gate.is_some() {
+            self.flush_gate(false);
         }
     }
 
@@ -744,6 +840,19 @@ impl Host {
         }
         *self.deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
+        // A lone finger that has waited long enough acts.
+        if self.settle.is_some_and(|s| s.started.elapsed() >= SETTLE) {
+            self.flush_settle();
+        }
+        // While a pen or finger is down, taps and drags need a little more: a menu list or panel
+        // doesn't scroll at the touch of a finger, and a long press waits longer for the context
+        // menu. A mouse keeps egui's normal values.
+        let touching = self.pen.is_some() || !self.fingers.is_empty() || self.settle.is_some();
+        self.ctx.options_mut(|o| {
+            o.input_options.max_click_dist = if touching { 16.0 } else { 6.0 };
+            o.input_options.max_click_duration = if touching { 1.0 } else { 0.8 };
+        });
+
         let ppp = self.scale * self.ctx.zoom_factor().max(0.1);
         let rect = egui::Rect::from_min_size(
             Pos2::ZERO,
@@ -768,9 +877,11 @@ impl Host {
         if let Some(g) = self.gate {
             if g.started.elapsed() >= HOLD {
                 match g.kind {
-                    GateKind::Eyedropper => self.flush_gate(false),
-                    GateKind::PenHold => {
+                    // Held: the eyedropper drops the style it picked (Option-click); the Pen
+                    // tool turns the anchor into a corner. The press then doesn't drag.
+                    GateKind::Eyedropper | GateKind::PenHold => {
                         self.hold_alt = true;
+                        self.hold_lock = true;
                         self.flush_gate(true);
                     }
                     GateKind::Frame => {}
@@ -786,6 +897,17 @@ impl Host {
         let mut full = ctx.run_ui(raw, |ui| self.app.ui(ui));
         self.handle_output(&logic.platform_output);
         self.handle_output(&full.platform_output);
+        // The toolbar's Delete button asks for the Delete key itself, so the tool in use handles it
+        // as it does on a keyboard (the Puppet Warp tool deletes the pin, not the whole shape).
+        let delete_id = egui::Id::new("vc-synth-delete");
+        if ctx.data_mut(|d| d.get_temp::<bool>(delete_id)).unwrap_or(false) {
+            ctx.data_mut(|d| d.remove::<bool>(delete_id));
+            let m = egui::Modifiers::NONE;
+            self.events.push(Event::Key { key: egui::Key::Delete, physical_key: Some(egui::Key::Delete), pressed: true, repeat: false, modifiers: m });
+            self.events.push(Event::Key { key: egui::Key::Delete, physical_key: Some(egui::Key::Delete), pressed: false, repeat: false, modifiers: m });
+            self.wake();
+        }
+
         // The on-screen keyboard only where text can be typed: a text field, or the Type tool.
         self.wants_keyboard = full.platform_output.ime.is_some() || logic.platform_output.ime.is_some();
 
@@ -1226,18 +1348,28 @@ pub unsafe extern "C" fn vc_tool_id(h: *mut c_void) -> *const c_char {
     }
 }
 
-/// Whether anything is selected: a no-turn rotation is tried (it refuses with a message about the
-/// selection when there is none).
+/// Whether anything (objects or anchor points) is selected.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_has_selection(h: *mut c_void) -> c_int {
-    guard(0, || {
-        let Some(h) = (unsafe { host(h) }) else { return 0 };
-        match h.app.run("object.rotate", json!({"angle": 0})) {
-            Ok(_) => 1,
-            Err(e) => {
-                let e = e.to_lowercase();
-                c_int::from(!(e.contains("select") || e.contains("nothing")))
-            }
-        }
-    })
+    match unsafe { host(h) } {
+        Some(h) => c_int::from(
+            h.app.session.active().is_some_and(|st| !st.selection.objects.is_empty() || !st.selection.anchors.is_empty()),
+        ),
+        None => 0,
+    }
+}
+
+/// The app's own colours, so the on-screen buttons follow its theme. `which`: 0 panel, 1 window
+/// (menus), 2 text, 3 accent. Returns 0xRRGGBBAA.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_theme_color(h: *mut c_void, which: c_int) -> u32 {
+    let Some(h) = (unsafe { host(h) }) else { return 0x2020_20FF };
+    let v = h.ctx.style().visuals.clone();
+    let c = match which {
+        0 => v.panel_fill,
+        1 => v.window_fill,
+        2 => v.text_color(),
+        _ => v.selection.bg_fill,
+    };
+    u32::from_be_bytes([c.r(), c.g(), c.b(), c.a()])
 }
