@@ -15,10 +15,18 @@ final class ArcMenuView: UIView {
         let tools: [String]
     }
 
+    /// The software's own colours (they change with its theme).
+    struct Theme {
+        let strip: UIColor
+        let text: UIColor
+        let accent: UIColor
+    }
+
     var onPick: (([String]) -> Void)?
     var onDismiss: (() -> Void)?
 
     private let items: [Item]
+    private let theme: Theme
     private let anchor: CGPoint
     private var buttons: [UIButton] = []
     private var rings: [UIView] = []
@@ -29,8 +37,9 @@ final class ArcMenuView: UIView {
     private let iconSize: CGFloat = 42
     private let thickness: CGFloat = 60
 
-    init(frame: CGRect, anchor: CGPoint, items: [Item]) {
+    init(frame: CGRect, anchor: CGPoint, items: [Item], theme: Theme) {
         self.items = items
+        self.theme = theme
         self.anchor = anchor
         super.init(frame: frame)
         backgroundColor = .clear
@@ -50,7 +59,7 @@ final class ArcMenuView: UIView {
 
         let strip = CAShapeLayer()
         strip.path = UIBezierPath(arcCenter: anchor, radius: radius, startAngle: start, endAngle: end, clockwise: true).cgPath
-        strip.strokeColor = UIColor(white: 0.15, alpha: 0.97).cgColor
+        strip.strokeColor = theme.strip.withAlphaComponent(0.98).cgColor
         strip.fillColor = UIColor.clear.cgColor
         strip.lineWidth = thickness
         strip.lineCap = .round
@@ -72,9 +81,9 @@ final class ArcMenuView: UIView {
             let ring = UIView(frame: CGRect(x: 0, y: 0, width: iconSize, height: iconSize))
             ring.center = c
             ring.layer.cornerRadius = iconSize / 2
-            ring.backgroundColor = UIColor(white: 1, alpha: 0.12)
+            ring.backgroundColor = theme.accent.withAlphaComponent(0.20)
             ring.layer.borderWidth = 2
-            ring.layer.borderColor = UIColor.systemBlue.cgColor
+            ring.layer.borderColor = theme.accent.cgColor
             ring.alpha = 0
             ring.isUserInteractionEnabled = false
             addSubview(ring)
@@ -83,8 +92,12 @@ final class ArcMenuView: UIView {
             let b = UIButton(type: .custom)
             b.frame = CGRect(x: 0, y: 0, width: iconSize, height: iconSize)
             b.center = c
-            b.setImage(UIImage(systemName: item.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 19, weight: .regular)), for: .normal)
-            b.tintColor = .white
+            // The software's own tool icon; an Apple symbol only if it is missing.
+            let icon = item.tools.first.flatMap { UIImage(named: "arc-" + $0) }?.withRenderingMode(.alwaysTemplate)
+                ?? UIImage(systemName: item.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 19, weight: .regular))
+            b.setImage(icon, for: .normal)
+            b.imageView?.contentMode = .scaleAspectFit
+            b.tintColor = theme.text
             b.tag = i
             b.addTarget(self, action: #selector(down(_:)), for: .touchDown)
             b.addTarget(self, action: #selector(up(_:)), for: [.touchUpOutside, .touchCancel])
@@ -95,10 +108,10 @@ final class ArcMenuView: UIView {
         }
 
         // The tool's name, just outside the strip.
-        labelPill.backgroundColor = UIColor(white: 0.15, alpha: 0.97)
+        labelPill.backgroundColor = theme.strip.withAlphaComponent(0.98)
         labelPill.layer.cornerRadius = 13
         labelPill.alpha = 0
-        label.textColor = .white
+        label.textColor = theme.text
         label.font = UIFont.systemFont(ofSize: 13, weight: .medium)
         label.textAlignment = .center
         labelPill.addSubview(label)
@@ -161,6 +174,7 @@ final class AssistiveTouchView: UIView {
     private var expanded = false
     private var active: UInt32 = 0
     private(set) var fingerDrawOn = false
+    private var idleTimer: Timer?
 
     private let off = UIColor(red: 0.10, green: 0.20, blue: 0.28, alpha: 0.82)
     private let on = UIColor(red: 0.12, green: 0.62, blue: 0.95, alpha: 0.96)
@@ -242,6 +256,17 @@ final class AssistiveTouchView: UIView {
     func setFingerDraw(_ on: Bool) {
         fingerDrawOn = on
         hand.backgroundColor = on ? UIColor.systemBlue : panelColor
+        refresh()
+    }
+
+    /// With no key latched, the ring closes again by itself and the button waits in standby.
+    private func scheduleStandby() {
+        idleTimer?.invalidate()
+        guard expanded, active == 0 else { return }
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 3.5, repeats: false) { [weak self] _ in
+            guard let self = self, self.expanded, self.active == 0 else { return }
+            self.toggleRing()
+        }
     }
 
     private func refresh() {
@@ -252,11 +277,13 @@ final class AssistiveTouchView: UIView {
             glyphs[i].textColor = (active & bits[i]) != 0 ? .white : UIColor(white: 0.85, alpha: 0.9)
         }
         CATransaction.commit()
-        main.backgroundColor = active != 0 ? UIColor.systemBlue.withAlphaComponent(0.55) : UIColor(white: 0.40, alpha: 0.60)
+        main.backgroundColor = (active != 0 || fingerDrawOn) ? UIColor.systemBlue.withAlphaComponent(0.55) : UIColor(white: 0.40, alpha: 0.60)
     }
 
     @objc private func toggleRing() {
         expanded.toggle()
+        idleTimer?.invalidate()
+        if expanded { scheduleStandby() }
         if expanded { hand.isHidden = false }
         UIView.animate(withDuration: 0.16, animations: {
             self.ringLayer.opacity = self.expanded ? 1 : 0
@@ -274,11 +301,13 @@ final class AssistiveTouchView: UIView {
         active ^= bits[i]
         refresh()
         onMods?(active)
+        scheduleStandby()
     }
 
     @objc private func handTapped() {
         setFingerDraw(!fingerDrawOn)
         onFingerDraw?(fingerDrawOn)
+        scheduleStandby()
     }
 
     @objc private func dragged(_ g: UIPanGestureRecognizer) {
