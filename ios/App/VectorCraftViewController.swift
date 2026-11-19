@@ -255,6 +255,16 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         metal.suspendFocus = false
     }
 
+    // MARK: Recent files
+
+    /// A copy of a file that was opened or saved, for File > Open Recent (see Documents/Recents).
+    private func keepRecent(name: String, data: Data) {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let folder = docs.appendingPathComponent("Recents", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? data.write(to: folder.appendingPathComponent(name.replacingOccurrences(of: "/", with: "_")))
+    }
+
     // MARK: Opening and placing: Files or Photos
 
     private func pick(_ m: Mode) {
@@ -350,7 +360,10 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         case .open:
             if urls.isEmpty { metal.cancelOpen() }
             for url in urls {
-                read(url, onFail: { self.metal.cancelOpen() }) { name, data in self.metal.deliverOpened(name: name, data: data) }
+                read(url, onFail: { self.metal.cancelOpen() }) { name, data in
+                    self.keepRecent(name: name, data: data)
+                    self.metal.deliverOpened(name: name, data: data)
+                }
             }
         case .place:
             for url in urls { read(url) { name, data in self.metal.deliverPlaced(name: name, data: data) } }
@@ -389,7 +402,10 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     /// "Open in VectorCraft" from Files or another app.
     private func openHandedOver(_ url: URL) {
         vcLog("handed over: \(url.lastPathComponent)")
-        read(url) { name, data in self.metal.deliverHandedOver(name: name, data: data) }
+        read(url) { name, data in
+            self.keepRecent(name: name, data: data)
+            self.metal.deliverHandedOver(name: name, data: data)
+        }
     }
 
     // MARK: Saving: Files, and for pictures also Photos
@@ -401,6 +417,7 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             return
         }
         let ext = (name as NSString).pathExtension.lowercased()
+        keepRecent(name: name, data: data)
         if ["png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "bmp", "webp"].contains(ext) {
             let sheet = UIAlertController(title: nil, message: "Save “\(name)” to", preferredStyle: .actionSheet)
             sheet.addAction(UIAlertAction(title: "Files", style: .default) { [weak self] _ in self?.exportToFiles(name: name, data: data) })
