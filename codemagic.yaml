@@ -16,6 +16,10 @@ workflows:
         # Prevent Homebrew from spending minutes auto-updating when installing xcodegen
         HOMEBREW_NO_AUTO_UPDATE: "1"
         HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        # The app's version. The build number is BUILD_OFFSET plus Codemagic's own build number:
+        # 3 builds were made before Codemagic (on GitHub), so the first Codemagic build is build 4.
+        MARKETING_VERSION: "0.4.0"
+        BUILD_OFFSET: "3"
     cache:
       cache_paths:
         - $HOME/.cargo/registry
@@ -26,6 +30,8 @@ workflows:
         script: |
           mkdir -p logs
           {
+            echo "=== Version ==="
+            echo "VectorCraft $MARKETING_VERSION build $((BUILD_OFFSET + ${BUILD_NUMBER:-1}))"
             echo "=== Xcode ==="
             xcodebuild -version
             echo "=== iOS SDKs ==="
@@ -53,137 +59,8 @@ workflows:
         script: |
           set -euo pipefail
           mkdir -p logs
-          python3 - <<'PYEOF'
-          import pathlib
-          import textwrap
-
-          report = []
-
-          def patch(path, pairs):
-              p = pathlib.Path(path)
-              if not p.exists():
-                  report.append(f"{path}: FILE NOT FOUND")
-                  return
-              s = p.read_text()
-              for old, new in pairs:
-                  count = s.count(old)
-                  report.append(f"{path}: {count} match(es) of {old[:70]!r}")
-                  s = s.replace(old, new)
-              p.write_text(s)
-
-          MAC = 'cfg!(target_os = "macos")'
-          APPLE = 'cfg!(any(target_os = "macos", target_os = "ios"))'
-
-          # Shortcuts: Apple's set (Command), never the Windows/Linux one.
-          patch("crates/ui-egui/src/keymap.rs", [
-              (
-                  "web.unwrap_or_else(Platform::current)",
-                  'web.unwrap_or_else(|| if cfg!(target_os = "ios") { Platform::Mac } else { Platform::current() })',
-              ),
-          ])
-
-          # Menus show ⌘⇧⌥ symbols, not "Ctrl+Shift+".
-          patch("crates/ui-egui/src/menus/entries.rs", [
-              (
-                  "    if " + MAC + " {\n        let mut mods = String::new();",
-                  "    if " + APPLE + " {\n        let mut mods = String::new();",
-              ),
-          ])
-          patch("crates/ui-egui/src/shortcut_editor.rs", [
-              (
-                  "if m.ctrl && (" + MAC + " || !m.command) {",
-                  "if m.ctrl && (" + APPLE + " || !m.command) {",
-              ),
-          ])
-
-          # Fonts: the iPad keeps Apple's fonts in /System/Library/Fonts, as macOS does.
-          patch("crates/text/src/fontdb/dirs.rs", [
-              (
-                  "if " + MAC + ' {\n        dirs.extend(["/System/Library/Fonts"',
-                  "if " + APPLE + ' {\n        dirs.extend(["/System/Library/Fonts"',
-              ),
-          ])
-
-          # Replace the built-in Touch workspace with Touch Space:
-          # every tool group in its tray, and panels collapsed to icons until opened.
-          patch("crates/ui-egui/src/workspaces.rs", [
-              (
-                  '        w(TOUCH, &|x| {\n'
-                  '            x.control_bar = true;\n'
-                  '            x.toolbar = true;\n'
-                  '            x.toolbar_advanced = true;\n'
-                  '            x.task_bar = true;\n'
-                  '            x.open_panel = Some("align".into());\n'
-                  '        }),\n',
-                  '        w("Touch Space", &|x| {\n'
-                  '            x.toolbar = true;\n'
-                  '            x.toolbar_advanced = true;\n'
-                  '            x.dock_collapsed = true;\n'
-                  '            x.open_panel = None;\n'
-                  '        }),\n',
-              ),
-          ])
-
-          # Toolbar: finger drag scrolls tools (buttons only sense clicks unless editing),
-          # and Undo, Redo, and Delete get a dedicated section under the other controls.
-          ui_src = "".join(f.read_text() for f in pathlib.Path("crates/ui-egui/src").rglob("*.rs"))
-
-          def icon(cands, last):
-              for c in cands:
-                  if '"' + c + '"' in ui_src and pathlib.Path("assets/icons/" + c + ".svg").exists():
-                      return c
-              for c in cands:
-                  if pathlib.Path("assets/icons/" + c + ".svg").exists():
-                      return c
-              return last
-
-          undo_i = icon(["undo-2", "undo", "rotate-ccw"], "ellipsis")
-          redo_i = icon(["redo-2", "redo", "rotate-cw"], "ellipsis")
-          trash_i = icon(["trash-2", "trash", "delete"], "ellipsis")
-          report.append(f"toolbar icons: {undo_i} {redo_i} {trash_i}")
-
-          touch_fn = textwrap.dedent('''
-              /// Undo, Redo and Delete: a section of their own under the other controls (as Affinity's
-              /// toolbar has them), for a finger or the pencil.
-              fn touch_actions(app: &mut VectorcraftApp, ui: &mut Ui, t: &Tokens) {
-                  ui.add_space(6.0);
-                  let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-                  ui.painter().line_segment([r.left_center() + vec2(6.0, 0.0), r.right_center() - vec2(6.0, 0.0)], Stroke::new(1.0, t.text_disabled));
-                  ui.add_space(6.0);
-                  ui.vertical_centered(|ui| {
-                      for (icon, tip, cmd) in [("@UNDO@", "Undo", "edit.undo"), ("@REDO@", "Redo", "edit.redo"), ("@TRASH@", "Delete", "edit.clear")] {
-                          if widgets::icon_button(ui, icon, tip, false, 30.0).clicked() {
-                              app.run(cmd, json!({})).ok();
-                          }
-                      }
-                  });
-                  ui.add_space(10.0);
-              }
-          ''').replace("@UNDO@", undo_i).replace("@REDO@", redo_i).replace("@TRASH@", trash_i)
-
-          patch("crates/ui-egui/src/toolbar.rs", [
-              (
-                  "let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), Sense::click_and_drag());",
-                  "let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), if editing { Sense::click_and_drag() } else { Sense::click() });",
-              ),
-              (
-                  "        ui.add_space(8.0);\n        bottom_controls(app, ui, &t, cols);\n    });",
-                  "        ui.add_space(8.0);\n        bottom_controls(app, ui, &t, cols);\n        touch_actions(app, ui, &t);\n    });",
-              ),
-          ])
-          tb = pathlib.Path("crates/ui-egui/src/toolbar.rs")
-          tb.write_text(tb.read_text() + "\n" + touch_fn)
-
-          # Draw custom tool cursors (as on macOS) instead of requesting OS cursors.
-          patch("crates/ui-egui/src/cursors.rs", [
-              (
-                  'pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_arch = "wasm32"));',
-                  'pub const OS_CURSORS: bool = !cfg!(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"));',
-              ),
-          ])
-
-          pathlib.Path("logs/patch-result.txt").write_text("\n".join(report) + "\n")
-          PYEOF
+          # All the changes to VectorCraft's own source live in this file (see its header).
+          python3 ios/patch_upstream.py
           cat logs/patch-result.txt
 
       - name: Save source snapshot for diagnosis
@@ -191,24 +68,20 @@ workflows:
         script: |
           # Run before Rust compilation so diagnostic snapshots are always captured even if cargo fails
           set +e
-          mkdir -p logs/src logs/src/toolbar logs/src/tools
-          for f in canvas/view.rs canvas/input.rs canvas/drag.rs prefs_dialog.rs workspaces.rs; do
-            if [ -f "crates/ui-egui/src/$f" ]; then
-              cp "crates/ui-egui/src/$f" "logs/src/$(echo "$f" | tr '/' '_')"
-            fi
+          mkdir -p logs/src/next
+          S=crates/ui-egui/src
+          # For the next round: the eyedropper, puppet warp, cursors, panels, the dock, recent files
+          # and the text input protocol.
+          for f in $(find crates -iname 'eyedropper*.rs' -o -iname 'puppet*.rs' 2>/dev/null | grep -v test); do
+            cp "$f" "logs/src/next/$(echo "$f" | tr '/' '_')"
           done
-          grep -rn -E "uiScaling|ui_scaling" crates --include=*.rs 2>/dev/null | head -60 > logs/src/ui-scaling-grep.txt
-          grep -rn -E "pub const TOUCH|fn set_workspace|\"window\.workspace" crates --include=*.rs 2>/dev/null | head -30 > logs/src/workspace-grep.txt
-          grep -n -E "pub (fn|struct|enum)" crates/ui-egui/src/place.rs 2>/dev/null | head -40 > logs/src/place-api.txt
-          cp -R crates/ui-egui/src/toolbar logs/src/toolbar/ 2>/dev/null
-          find logs/src/toolbar -name '*test*' -delete 2>/dev/null
-          cp crates/tools/src/catalog.rs logs/src/tools/ 2>/dev/null
-          cp -R crates/tools/src/catalog logs/src/tools/ 2>/dev/null
-          grep -rn -E "view\.rotate|rotate_view|rotateView|\"object\.rotate|transform\.rotate" crates --include=*.rs 2>/dev/null | grep -v test | head -80 > logs/src/rotate-grep.txt
-          grep -rn -i "tray" crates/tools/src crates/ui-egui/src --include=*.rs 2>/dev/null | grep -v test | head -120 > logs/src/tray-grep.txt
+          cp -R $S/cursors logs/src/next/cursors-dir 2>/dev/null
+          cp $S/cursors.rs $S/panel_docking.rs $S/dock.rs $S/panels.rs $S/ime.rs logs/src/next/ 2>/dev/null
+          ls -R $S/panel_docking $S/panels 2>/dev/null | head -150 > logs/src/next/panel-files.txt
+          grep -rn -B10 -A10 "no file reader" crates --include=*.rs 2>/dev/null | head -150 > logs/src/next/no-file-reader.txt
+          grep -rn -i "recent" $S --include=*.rs 2>/dev/null | grep -v test | head -100 > logs/src/next/recent-grep.txt
+          grep -rn -i -E "not.allowed|no_entry|NotAllowed|forbidden|blocked" $S/cursors.rs $S/cursors 2>/dev/null | head -40 > logs/src/next/cursor-blocked-grep.txt
           cp crates/ui-egui/src/toolbar.rs logs/src/ 2>/dev/null
-          grep -rn -B2 -A30 "fn strip_scroll" crates/ui-egui/src --include=*.rs 2>/dev/null | head -80 > logs/src/strip-scroll.txt
-          sed -n 320,420p crates/engine/src/cmd/object/transform.rs 2>/dev/null > logs/src/transform-rotate.txt
           true
 
       - name: Build the Rust core
@@ -324,7 +197,9 @@ workflows:
         script: |
           set -euo pipefail
           NATIVE_LIBS="${NATIVE_LIBS:-$(cat logs/native-libs.txt 2>/dev/null || true)}"
+          APP_BUILD=$((BUILD_OFFSET + ${BUILD_NUMBER:-1}))
           echo "Linking with NATIVE_LIBS: $NATIVE_LIBS"
+          echo "Version $MARKETING_VERSION, build $APP_BUILD"
           cd ios
           xcodebuild \
             -project VectorCraft.xcodeproj \
@@ -334,6 +209,8 @@ workflows:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             NATIVE_LIBS="$NATIVE_LIBS" \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$APP_BUILD" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
