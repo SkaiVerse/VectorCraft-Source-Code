@@ -81,6 +81,9 @@ workflows:
           grep -rn -B10 -A10 "no file reader" crates --include=*.rs 2>/dev/null | head -150 > logs/src/next/no-file-reader.txt
           grep -rn -i "recent" $S --include=*.rs 2>/dev/null | grep -v test | head -100 > logs/src/next/recent-grep.txt
           grep -rn -i -E "not.allowed|no_entry|NotAllowed|forbidden|blocked" $S/cursors.rs $S/cursors 2>/dev/null | head -40 > logs/src/next/cursor-blocked-grep.txt
+          cp $S/icons.rs logs/src/next/ 2>/dev/null
+          head -c 250000 $S/icon_data.rs > logs/src/next/icon_data_head.rs 2>/dev/null
+          find . -iname '*selection*' \( -name '*.svg' -o -name '*.rs' \) -not -path './target/*' 2>/dev/null | head -20 > logs/src/next/selection-icon-files.txt
           cp crates/ui-egui/src/toolbar.rs logs/src/ 2>/dev/null
           true
 
