@@ -49,6 +49,8 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        let info = Bundle.main.infoDictionary
+        vcLog("VectorCraft \(info?["CFBundleShortVersionString"] ?? "?") (build \(info?["CFBundleVersion"] ?? "?"))")
         view.backgroundColor = UIColor(red: 0.11, green: 0.11, blue: 0.12, alpha: 1)
 
         metal.translatesAutoresizingMaskIntoConstraints = false
@@ -76,9 +78,7 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         // Apple Pencil: squeeze opens the tool arc (and the context menu); double tap goes to the
         // next tool in the same tray.
         metal.onPencilSqueeze = { [weak self] point in
-            guard let self = self else { return }
-            self.metal.contextClick(at: point)
-            self.showArcMenu(at: point)
+            self?.showArcMenu(at: point)
         }
         metal.onPencilTap = { [weak self] in self?.cycleTray() }
         metal.onFingerDrawChanged = { [weak self] on in self?.assistive.setFingerDraw(on) }
@@ -171,15 +171,14 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     private func showArcMenu(at point: CGPoint) {
         hideArcMenu()
         let anchor = metal.convert(point, to: view)
-        let menu = ArcMenuView(frame: view.bounds, anchor: anchor, items: arcItems)
+        let theme = ArcMenuView.Theme(strip: metal.themeColor(1), text: metal.themeColor(2), accent: metal.themeColor(3))
+        let menu = ArcMenuView(frame: view.bounds, anchor: anchor, items: arcItems, theme: theme)
         menu.onPick = { [weak self] tools in
             self?.pickTool(tools)
             self?.hideArcMenu()
-            self?.metal.closeMenus()
         }
         menu.onDismiss = { [weak self] in
             self?.hideArcMenu()
-            self?.metal.closeMenus()
         }
         view.insertSubview(menu, belowSubview: assistive)
         arcMenu = menu
