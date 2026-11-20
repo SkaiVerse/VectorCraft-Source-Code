@@ -18,25 +18,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     var onPrint: ((String, Data) -> Void)?
     var onPencilTap: (() -> Void)?
     var onPencilSqueeze: ((CGPoint) -> Void)?
-    var onFingerDrawChanged: ((Bool) -> Void)?
-    /// The twist in degrees while a selection is being turned (nil: the gesture is over).
-    var onTwist: ((Double?) -> Void)?
     /// Modifier keys held down on screen (Assistive Touch): added to every real one.
     var stickyMods: UInt32 = 0 {
         didSet { if let h = handle { vc_mods(h, stickyMods) } }
     }
-    private(set) var fingerDraw = false
     /// Where the pencil (or the pointer) last was.
     private(set) var lastPoint = CGPoint(x: 200, y: 200)
     /// A touch wider than this (points) is a resting palm, not a fingertip.
-    private let palmRadius: CGFloat = 42
+    private let palmRadius: CGFloat = 70
     private var ignoredTouches = Set<ObjectIdentifier>()
     private var twistLast = 0.0
     private var twistTotal = 0.0
     private var twistActive = false
-    private var twistTurnsSelection = false
-    private var twistApplied = false
-    private var twistShown = 0.0
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
@@ -144,11 +137,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if !suspendFocus && !isFirstResponder { _ = becomeFirstResponder() }
         repeatHeldKey()
         let flags = vc_frame(h)
-        let fd = (flags & 4) != 0
-        if fd != fingerDraw {
-            fingerDraw = fd
-            onFingerDrawChanged?(fd)
-        }
         let wants = (flags & 2) != 0
         if wants != softKeyboard {
             softKeyboard = wants
@@ -233,11 +221,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     }
 
     // MARK: Commands for the on-screen buttons
-
-    func setFingerDraw(_ on: Bool) {
-        fingerDraw = on
-        if let h = handle { vc_set_finger_draw(h, on ? 1 : 0) }
-    }
 
     @discardableResult
     func run(_ command: String, _ json: String = "{}") -> Bool {
@@ -497,50 +480,33 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         if t != .zero { vc_scroll(h, Float(t.x), Float(t.y), modBits(g.modifierFlags)) }
     }
 
+    /// Two fingers twisting turn the canvas (clockwise on screen, as the fingers). The fingers also
+    /// reach the app as touches, which pan and zoom.
     @objc private func twisted(_ g: UIRotationGestureRecognizer) {
-        guard let h = handle else { return }
+        guard handle != nil else { return }
         let degrees = Double(g.rotation) * 180 / Double.pi
         switch g.state {
         case .began:
             twistActive = false
-            twistApplied = false
             twistTotal = 0
             twistLast = 0
-            twistShown = 0
-            twistTurnsSelection = vc_has_selection(h) != 0
         case .changed:
             // Only a clear twist counts: a pinch or a pan wobbles a few degrees.
             if !twistActive {
-                guard abs(degrees) > 25, fingersDown == 2 else { return }
+                guard abs(degrees) > 20, fingersDown >= 2 else { return }
                 twistActive = true
                 twistLast = degrees
+                vcLog("canvas twist begins")
             }
             let delta = degrees - twistLast
             twistLast = degrees
             twistTotal += delta
-            if twistTurnsSelection {
-                // A live preview: the selection is turned to the twist so far, each time in place
-                // of the last turn, so the undo history ends up with one step.
-                guard abs(twistTotal - twistShown) >= 0.5 else { return }
-                if twistApplied { run("edit.undo") }
-                // The app turns anticlockwise for a positive angle; a clockwise twist is negative.
-                twistApplied = run("object.rotate", "{\"angle\": \(-twistTotal)}")
-                twistShown = twistTotal
-                onTwist?(twistTotal)
-            } else {
-                // Clockwise on screen, as the finger twist.
-                run("view.rotate", "{\"angle\": \(delta)}")
-            }
+            if !run("view.rotate", "{\"angle\": \(delta)}") { vcLog("view.rotate did not run") }
         case .ended:
-            onTwist?(nil)
+            if twistActive { vcLog("canvas twist: \(Int(twistTotal)) degrees") }
             twistActive = false
-            twistApplied = false
         default:
-            // The gesture was interrupted: the preview is taken back.
-            if twistApplied { run("edit.undo") }
-            onTwist?(nil)
             twistActive = false
-            twistApplied = false
         }
     }
 
