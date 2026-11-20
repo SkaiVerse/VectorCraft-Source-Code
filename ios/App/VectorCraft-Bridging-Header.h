@@ -43,7 +43,6 @@ void vc_open_cancel(void *h);
 void vc_place_file(void *h, const char *name, const uint8_t *data, size_t len);
 void vc_drop_file(void *h, const char *name, const uint8_t *data, size_t len);
 
-void vc_set_finger_draw(void *h, int on);
 void vc_mods(void *h, uint32_t mods);
 int vc_run(void *h, const char *command, const char *params_json);
 const char *vc_tool_id(void *h);
