@@ -157,10 +157,8 @@ final class ArcMenuView: UIView {
 /// at once, as when holding them on a keyboard. A small hand switches "draw with finger".
 final class AssistiveTouchView: UIView {
     var onMods: ((UInt32) -> Void)?
-    var onFingerDraw: ((Bool) -> Void)?
 
     private let main = UIButton(type: .custom)
-    private let hand = UIButton(type: .custom)
     private let ringLayer = CALayer()
     private var wedges: [CAShapeLayer] = []
     private var wedgePaths: [UIBezierPath] = []
@@ -173,7 +171,6 @@ final class AssistiveTouchView: UIView {
 
     private var expanded = false
     private var active: UInt32 = 0
-    private(set) var fingerDrawOn = false
     private var idleTimer: Timer?
 
     private let off = UIColor(red: 0.10, green: 0.20, blue: 0.28, alpha: 0.82)
@@ -219,19 +216,6 @@ final class AssistiveTouchView: UIView {
         main.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragged(_:))))
         addSubview(main)
 
-        hand.frame = CGRect(x: 0, y: 0, width: 40, height: 40)
-        hand.center = CGPoint(x: c.x + 82, y: c.y - 82)
-        hand.backgroundColor = panelColor
-        hand.layer.cornerRadius = 20
-        hand.layer.borderWidth = 1
-        hand.layer.borderColor = borderColor.cgColor
-        hand.tintColor = .white
-        hand.setImage(UIImage(systemName: "hand.point.up.left.fill"), for: .normal)
-        hand.alpha = 0
-        hand.isHidden = true
-        hand.addTarget(self, action: #selector(handTapped), for: .touchUpInside)
-        addSubview(hand)
-
         addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(tapped(_:))))
     }
 
@@ -247,16 +231,9 @@ final class AssistiveTouchView: UIView {
 
     /// Only the buttons and the ring take touches; the rest lets them through to the canvas.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        if !hand.isHidden, hand.frame.contains(point) { return hand }
         if main.frame.contains(point) { return main }
         if expanded, wedgePaths.contains(where: { $0.contains(point) }) { return self }
         return nil
-    }
-
-    func setFingerDraw(_ on: Bool) {
-        fingerDrawOn = on
-        hand.backgroundColor = on ? UIColor.systemBlue : panelColor
-        refresh()
     }
 
     /// With no key latched, the ring closes again by itself and the button waits in standby.
@@ -277,21 +254,17 @@ final class AssistiveTouchView: UIView {
             glyphs[i].textColor = (active & bits[i]) != 0 ? .white : UIColor(white: 0.85, alpha: 0.9)
         }
         CATransaction.commit()
-        main.backgroundColor = (active != 0 || fingerDrawOn) ? UIColor.systemBlue.withAlphaComponent(0.55) : UIColor(white: 0.40, alpha: 0.60)
+        main.backgroundColor = active != 0 ? UIColor.systemBlue.withAlphaComponent(0.55) : UIColor(white: 0.40, alpha: 0.60)
     }
 
     @objc private func toggleRing() {
         expanded.toggle()
         idleTimer?.invalidate()
         if expanded { scheduleStandby() }
-        if expanded { hand.isHidden = false }
         UIView.animate(withDuration: 0.16, animations: {
             self.ringLayer.opacity = self.expanded ? 1 : 0
             self.glyphs.forEach { $0.alpha = self.expanded ? 1 : 0 }
-            self.hand.alpha = self.expanded ? 1 : 0
-        }, completion: { _ in
-            if !self.expanded { self.hand.isHidden = true }
-        })
+        }, completion: nil)
     }
 
     @objc private func tapped(_ g: UITapGestureRecognizer) {
@@ -301,12 +274,6 @@ final class AssistiveTouchView: UIView {
         active ^= bits[i]
         refresh()
         onMods?(active)
-        scheduleStandby()
-    }
-
-    @objc private func handTapped() {
-        setFingerDraw(!fingerDrawOn)
-        onFingerDraw?(fingerDrawOn)
         scheduleStandby()
     }
 
