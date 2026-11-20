@@ -24,6 +24,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: VectorCraft
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         NSPhotoLibraryAddUsageDescription: VectorCraft saves the pictures you export to your Photos library.
