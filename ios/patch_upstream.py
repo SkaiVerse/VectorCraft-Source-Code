@@ -75,8 +75,6 @@ patch("crates/ui-egui/src/cursors.rs", [
 ])
 
 # ---- Toolbar -------------------------------------------------------------------------------------
-# * A finger drag on a tool button scrolls the tools (the buttons only sense clicks, unless the
-#   toolbar is being edited).
 # * The controls under the tools (colours, screen mode, draw modes) and Undo, Redo and Delete stay
 #   fixed at the bottom while the tools scroll.
 ui_src = "".join(f.read_text() for f in pathlib.Path("crates/ui-egui/src").rglob("*.rs"))
@@ -124,8 +122,6 @@ touch_fn = textwrap.dedent('''
 ''').replace("@UNDO@", undo_i).replace("@REDO@", redo_i).replace("@TRASH@", trash_i)
 
 patch("crates/ui-egui/src/toolbar.rs", [
-    ("let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), Sense::click_and_drag());",
-     "let (rect, resp) = ui.allocate_exact_size(vec2(36.0, PITCH - 1.0), if editing { Sense::click_and_drag() } else { Sense::click() });"),
     # The scrolling tools leave room for the fixed section below them.
     ('    widgets::strip_scroll(ui, "toolbar", |ui| {',
      '    let fixed_id = egui::Id::new("vc-toolbar-fixed-height");\n'
@@ -135,8 +131,12 @@ patch("crates/ui-egui/src/toolbar.rs", [
      '    widgets::strip_scroll(ui, "toolbar", |ui| {'),
     ("        ui.add_space(8.0);\n        bottom_controls(app, ui, &t, cols);\n    });",
      "        ui.add_space(8.0);\n    });\n    });\n"
-     "    // The fixed section: colours, screen mode, draw modes, then Undo, Redo and Delete.\n"
+     "    // The fixed section: a divider, then colours, screen mode, draw modes, then Undo, Redo and Delete.\n"
      "    let fixed_top = ui.cursor().top();\n"
+     "    ui.add_space(4.0);\n"
+     "    let (divider, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());\n"
+     "    ui.painter().line_segment([divider.left_center() + vec2(6.0, 0.0), divider.right_center() - vec2(6.0, 0.0)], Stroke::new(1.0, t.text_disabled));\n"
+     "    ui.add_space(6.0);\n"
      "    bottom_controls(app, ui, &t, cols);\n"
      "    touch_actions(app, ui, &t);\n"
      "    let measured = ui.cursor().top() - fixed_top;\n"
