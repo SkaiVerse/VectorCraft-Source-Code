@@ -5,7 +5,6 @@ extension Notification.Name {
     static let vcOpenURL = Notification.Name("VectorCraftOpenURL")
     static let vcToggleAssistive = Notification.Name("VectorCraftToggleAssistive")
     static let vcToggleActionBar = Notification.Name("VectorCraftToggleActionBar")
-    static let vcToggleFingerDraw = Notification.Name("VectorCraftToggleFingerDraw")
 }
 
 @main
@@ -35,10 +34,6 @@ struct VectorCraftApp: App {
                     NotificationCenter.default.post(name: .vcToggleActionBar, object: nil)
                 }
                 .keyboardShortcut("u", modifiers: [.command, .option, .shift])
-                Button("Draw With Finger On or Off") {
-                    NotificationCenter.default.post(name: .vcToggleFingerDraw, object: nil)
-                }
-                .keyboardShortcut("d", modifiers: [.command, .option, .shift])
             }
             CommandMenu("Fonts") {
                 Button("Add Installed Fonts…") {
