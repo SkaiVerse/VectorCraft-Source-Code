@@ -30,7 +30,6 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
     private let actionBar = ActionBarView()
     private var arcMenu: ArcMenuView?
     private var assistivePlaced = false
-    private let twistLabel = UILabel()
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -81,21 +80,9 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             self?.showArcMenu(at: point)
         }
         metal.onPencilTap = { [weak self] in self?.cycleTray() }
-        metal.onFingerDrawChanged = { [weak self] on in self?.assistive.setFingerDraw(on) }
-        metal.onTwist = { [weak self] degrees in self?.showTwist(degrees) }
-
-        twistLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 17, weight: .semibold)
-        twistLabel.textColor = .white
-        twistLabel.textAlignment = .center
-        twistLabel.backgroundColor = UIColor(white: 0.12, alpha: 0.92)
-        twistLabel.layer.cornerRadius = 16
-        twistLabel.clipsToBounds = true
-        twistLabel.alpha = 0
-        view.addSubview(twistLabel)
 
         // On-screen buttons.
         assistive.onMods = { [weak self] bits in self?.metal.stickyMods = bits }
-        assistive.onFingerDraw = { [weak self] on in self?.metal.setFingerDraw(on) }
         actionBar.onAction = { [weak self] command in self?.metal.run(command) }
         view.addSubview(actionBar)
         view.addSubview(assistive)
@@ -127,11 +114,6 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             self.actionBar.isHidden.toggle()
             UserDefaults.standard.set(!self.actionBar.isHidden, forKey: "vcActionBar")
         }
-        nc.addObserver(forName: .vcToggleFingerDraw, object: nil, queue: .main) { [weak self] _ in
-            guard let self = self else { return }
-            self.metal.setFingerDraw(!self.metal.fingerDraw)
-            self.assistive.setFingerDraw(self.metal.fingerDraw)
-        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -146,19 +128,6 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
             assistive.restorePosition(in: view)
             assistivePlaced = true
         }
-    }
-
-    /// "Rotate 37°" while two fingers turn the selection.
-    private func showTwist(_ degrees: Double?) {
-        guard let d = degrees else {
-            UIView.animate(withDuration: 0.2) { self.twistLabel.alpha = 0 }
-            return
-        }
-        twistLabel.text = String(format: "Rotate %.0f°", -d)
-        twistLabel.sizeToFit()
-        let w = twistLabel.bounds.width + 28
-        twistLabel.frame = CGRect(x: (view.bounds.width - w) / 2, y: view.safeAreaInsets.top + 60, width: w, height: 32)
-        twistLabel.alpha = 1
     }
 
     // MARK: Apple Pencil
