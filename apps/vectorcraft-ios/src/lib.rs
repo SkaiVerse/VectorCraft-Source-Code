@@ -1,16 +1,17 @@
+
 //! VectorCraft for iPad: the engine and egui interface, drawn with Metal, driven by a Swift shell.
 //!
 //! Swift owns the window, Files, printing, the clipboard and the iPad's keyboard, pointer, fingers
 //! and Apple Pencil. This crate owns the app, the egui context and the graphics, and builds the
 //! frame's input itself (no winit, no eframe).
 #![allow(clippy::missing_safety_doc)]
-
+ 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
-
+ 
 use egui::{Event, PointerButton, Pos2, TouchDeviceId, TouchId, TouchPhase};
 use serde_json::json;
 use vectorcraft_engine::Session;
@@ -19,11 +20,11 @@ use vectorcraft_ui_egui::print::{PrintJob, PrintService, Printer};
 use vectorcraft_ui_egui::stylus::{PenPose, PenSample, StylusFeed};
 use vectorcraft_ui_egui::touch::{self, Source};
 use vectorcraft_ui_egui::{Inbox, PickedInbox, Services, UiState, VectorcraftApp};
-
+ 
 // ---------------------------------------------------------------------------------------------
 // Callbacks into Swift (must match VectorCraft-Bridging-Header.h, field for field)
 // ---------------------------------------------------------------------------------------------
-
+ 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VCCallbacks {
@@ -36,23 +37,23 @@ pub struct VCCallbacks {
     pub paste_text: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
     pub print_pdf: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const u8, usize)>,
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------------------------
-
+ 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
-
+ 
 fn documents_dir() -> Option<PathBuf> {
     home().map(|h| h.join("Documents"))
 }
-
+ 
 fn config_dir() -> Option<PathBuf> {
     home().map(|h| h.join("Library/Application Support/VectorCraft"))
 }
-
+ 
 fn note(msg: &str) {
     use std::io::Write;
     let Some(dir) = documents_dir() else { return };
@@ -60,7 +61,7 @@ fn note(msg: &str) {
         let _ = writeln!(f, "[rust] {msg}");
     }
 }
-
+ 
 /// Documents/Recents holds a copy of every file that was opened or saved, so File > Open Recent
 /// can read it again (the iPad gives the app a copy of a file, not its place in Files).
 fn recent_copy(path: &str) -> Option<PathBuf> {
@@ -68,7 +69,7 @@ fn recent_copy(path: &str) -> Option<PathBuf> {
     let copy = documents_dir()?.join("Recents").join(name);
     copy.is_file().then_some(copy)
 }
-
+ 
 fn read_recent(path: &str) -> Result<Vec<u8>, String> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
@@ -78,18 +79,18 @@ fn read_recent(path: &str) -> Result<Vec<u8>, String> {
         },
     }
 }
-
+ 
 fn cstring(s: &str) -> CString {
     CString::new(s.replace('\0', "")).unwrap_or_default()
 }
-
+ 
 unsafe fn from_c(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
-
+ 
 unsafe fn bytes_from(data: *const u8, len: usize) -> Vec<u8> {
     if data.is_null() || len == 0 {
         Vec::new()
@@ -97,17 +98,17 @@ unsafe fn bytes_from(data: *const u8, len: usize) -> Vec<u8> {
         unsafe { std::slice::from_raw_parts(data, len) }.to_vec()
     }
 }
-
+ 
 fn guard<R>(default: R, f: impl FnOnce() -> R) -> R {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
 }
-
+ 
 fn to_mods(m: u32) -> egui::Modifiers {
     // Only Apple's modifier rules: Command is the shortcut key, Control stays Control.
     let cmd = m & 8 != 0;
     egui::Modifiers { alt: m & 4 != 0, ctrl: m & 2 != 0, shift: m & 1 != 0, mac_cmd: cmd, command: cmd }
 }
-
+ 
 fn hid_to_key(hid: u32) -> Option<egui::Key> {
     use egui::Key;
     const LETTERS: [Key; 26] = [
@@ -152,18 +153,18 @@ fn hid_to_key(hid: u32) -> Option<egui::Key> {
         _ => return None,
     })
 }
-
+ 
 /// How long a press must stay still to count as "press and hold" (the Pen tool's corner point,
 /// the eyedropper's drop).
 const HOLD: Duration = Duration::from_millis(300);
-
+ 
 /// How far (points) a finger on a panel, bar or menu must travel before it scrolls (and does not tap).
 const SCROLL_SLOP: f32 = 10.0;
-
+ 
 /// How long a finger rests still on a panel, bar or menu before it presses: a panel is dragged
 /// by holding it first, so a quick drag only scrolls.
 const UI_HOLD: Duration = Duration::from_millis(400);
-
+ 
 /// A press that waits before the app sees it.
 #[derive(Clone, Copy, PartialEq)]
 enum GateKind {
@@ -175,14 +176,14 @@ enum GateKind {
     /// The Pen tool: a held press turns the anchor under it into a corner (Option-click).
     PenHold,
 }
-
+ 
 #[derive(Clone, Copy)]
 struct Gate {
     kind: GateKind,
     started: Instant,
     origin: Pos2,
 }
-
+ 
 /// A finger on a panel, bar or menu that has not yet become a tap, a scroll or a press-and-drag.
 #[derive(Clone, Copy)]
 struct UiTouch {
@@ -193,11 +194,11 @@ struct UiTouch {
     mods: egui::Modifiers,
     scrolling: bool,
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // Preferences (the same files as the desktop app, in the app's own folder)
 // ---------------------------------------------------------------------------------------------
-
+ 
 fn load_prefs(app: &mut VectorcraftApp) {
     let Some(dir) = config_dir() else { return };
     let Ok(bytes) = std::fs::read(dir.join("ui.json")) else { return };
@@ -209,7 +210,7 @@ fn load_prefs(app: &mut VectorcraftApp) {
         Err(e) => note(&format!("preferences could not be read: {e}")),
     }
 }
-
+ 
 fn save_prefs(app: &VectorcraftApp) {
     let Some(dir) = config_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
@@ -223,30 +224,30 @@ fn save_prefs(app: &VectorcraftApp) {
         let _ = std::fs::rename(&tmp, dir.join("ui.json"));
     }
 }
-
+ 
 fn dir_string(name: &str) -> Option<String> {
     let dir = config_dir()?.join(name);
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.to_string_lossy().into_owned())
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // Services: what the app asks the iPad to do
 // ---------------------------------------------------------------------------------------------
-
+ 
 struct IosPrint {
     cb: VCCallbacks,
 }
-
+ 
 // The callbacks are only ever used on the main thread, from the app's own frame.
 unsafe impl Send for IosPrint {}
-
+ 
 impl PrintService for IosPrint {
     fn printers(&mut self) -> Vec<Printer> {
         // iPadOS has no printer list for apps: its print sheet picks the printer.
         vec![]
     }
-
+ 
     fn print(&mut self, job: &PrintJob) -> Result<String, String> {
         let Some(f) = self.cb.print_pdf else { return Err("printing is not available".to_string()) };
         let title = cstring(&job.title.to_string());
@@ -254,7 +255,7 @@ impl PrintService for IosPrint {
         Ok(format!("Printing “{}”: pick the printer in the print sheet", job.title))
     }
 }
-
+ 
 fn build_services(cb: VCCallbacks, picked: &PickedInbox, dropped: &Inbox, place: &PlaceInbox, stylus: StylusFeed) -> Services {
     Services {
         // File › Open…: Apple's Files picker; the answer (or None when cancelled) arrives in `picked`.
@@ -297,11 +298,11 @@ fn build_services(cb: VCCallbacks, picked: &PickedInbox, dropped: &Inbox, place:
         ..Default::default()
     }
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // Graphics (Metal through wgpu)
 // ---------------------------------------------------------------------------------------------
-
+ 
 struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -310,7 +311,7 @@ struct Gpu {
     config: wgpu::SurfaceConfiguration,
     needs_reconfigure: bool,
 }
-
+ 
 impl Gpu {
     fn new(layer: *mut c_void, width: u32, height: u32) -> Result<Gpu, String> {
         let instance = wgpu::Instance::default();
@@ -343,15 +344,15 @@ impl Gpu {
         Ok(Gpu { surface, device, queue, renderer, config, needs_reconfigure: false })
     }
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // The host: one per window
 // ---------------------------------------------------------------------------------------------
-
+ 
 /// The pen's touch device (fingers use another, so egui doesn't pinch a pen with a finger).
 const PEN_DEVICE: TouchDeviceId = TouchDeviceId(1);
 const FINGER_DEVICE: TouchDeviceId = TouchDeviceId(2);
-
+ 
 struct Host {
     app: VectorcraftApp,
     ctx: egui::Context,
@@ -397,14 +398,14 @@ struct Host {
     pen_origin: Pos2,
     pen_moves: usize,
 }
-
+ 
 fn wake_at(deadline: &Arc<Mutex<Option<Instant>>>, at: Instant) {
     let mut d = deadline.lock().unwrap_or_else(|e| e.into_inner());
     if d.is_none_or(|cur| at < cur) {
         *d = Some(at);
     }
 }
-
+ 
 impl Host {
     fn new(layer: *mut c_void, width: u32, height: u32, scale: f32, cb: VCCallbacks) -> Result<Host, String> {
         // Folders that show up in Files > On My iPad > VectorCraft.
@@ -414,7 +415,7 @@ impl Host {
             // The app's own Fonts folder is scanned with the iPad's fonts.
             vectorcraft_text::set_app_font_dir(fonts);
         }
-
+ 
         let gpu = Gpu::new(layer, width, height)?;
         let ctx = egui::Context::default();
         // Apple's shortcut set only: the app asks the context which system it runs on.
@@ -429,13 +430,13 @@ impl Host {
                 wake_at(&dl, at);
             });
         }
-
+ 
         let picked = PickedInbox::default();
         let dropped = Inbox::default();
         let place = PlaceInbox::default();
         let stylus = StylusFeed::on_ui_thread();
         let services = build_services(cb, &picked, &dropped, &place, stylus.clone());
-
+ 
         // The app's own rule for an iPad with a pen: fingers pan, zoom and tap to undo on the canvas
         // and work the panels, menus and buttons; the pen draws.
         touch::set_pen_seen(true);
@@ -447,7 +448,7 @@ impl Host {
             app.ui.workspace = "Essentials".to_string();
         }
         app.ui.touch_workspace_restore = None;
-
+ 
         // What the user keeps lives next to the preferences, as on the desktop.
         app.session.swatch_libraries.set_user_dir(dir_string("Swatches"));
         app.session.style_libraries.set_user_dir(dir_string("Graphic Styles"));
@@ -457,7 +458,7 @@ impl Host {
         app.session.libraries.set_dir(dir_string("Libraries"));
         // Data Recovery copies: the automatic saves of unsaved work.
         app.session.recovery.set_default_folder(dir_string("Data Recovery"));
-
+ 
         Ok(Host {
             app,
             ctx,
@@ -494,11 +495,11 @@ impl Host {
             pen_moves: 0,
         })
     }
-
+ 
     fn wake(&self) {
         wake_at(&self.deadline, Instant::now());
     }
-
+ 
     fn push(&mut self, e: egui::Event) {
         if self.gate.is_some() {
             self.deferred.push(e);
@@ -510,7 +511,7 @@ impl Host {
         }
         self.wake();
     }
-
+ 
     /// Holds the pen's press (and all that follows it) back until the gate opens.
     fn begin_gate(&mut self, pos: Pos2) {
         let tool = self.app.session.tool_id().to_string();
@@ -521,7 +522,7 @@ impl Host {
         };
         self.gate = Some(Gate { kind, started: Instant::now(), origin: pos });
     }
-
+ 
     /// Lets the held events through, with Option held when `alt` (a press-and-hold). The press
     /// goes through now and what came after it a frame later, so the app sees the press (and the
     /// tool starts) before it moves or lifts.
@@ -550,7 +551,7 @@ impl Host {
         self.later.extend(rest);
         self.wake();
     }
-
+ 
     /// Tells egui which modifier keys (Shift, Command, ...) are down, whenever that changes.
     /// This egui version learns modifier state only from this event.
     fn set_modifiers(&mut self, m: egui::Modifiers) {
@@ -559,19 +560,19 @@ impl Host {
             self.push(Event::ModifiersChanged(m));
         }
     }
-
+ 
     /// Points in the UIKit sense, converted to egui points (the interface scaling zooms).
     fn pt(&self, x: f32, y: f32) -> Pos2 {
         let z = self.ctx.zoom_factor().max(0.1);
         egui::pos2(x / z, y / z)
     }
-
+ 
     // --- pen and finger contacts (the model of the web build's pen and touch code) -------------
-
+ 
     fn push_touch(&mut self, device: TouchDeviceId, id: i32, phase: TouchPhase, pos: Pos2, force: Option<f32>) {
         self.push(Event::Touch { device_id: device, id: TouchId::from(id as u64), phase, pos, force });
     }
-
+ 
     fn press(&mut self, id: i32, pos: Pos2, button: PointerButton, mods: egui::Modifiers) {
         self.primary = Some(id);
         self.primary_button = Some(button);
@@ -580,10 +581,9 @@ impl Host {
         self.push(Event::PointerMoved(pos));
         self.push(Event::PointerButton { pos, button, pressed: true, modifiers: mods });
     }
-
+ 
     fn release(&mut self, pos: Pos2, mods: egui::Modifiers) {
         self.primary = None;
-        self.dead = None;
         self.hold_lock = false;
         if let Some(button) = self.primary_button.take() {
             self.push(Event::ModifiersChanged(mods));
@@ -598,7 +598,7 @@ impl Host {
             }
         }
     }
-
+ 
     /// Cancel every finger down (a palm under a pen landing).
     fn cancel_fingers(&mut self, pos: Pos2, mods: egui::Modifiers) {
         for id in std::mem::take(&mut self.fingers) {
@@ -609,16 +609,16 @@ impl Host {
             }
         }
     }
-
+ 
     fn pen_sample(&self, pressure: f32, pose: PenPose) {
         self.stylus.set_sample(Some(PenSample { pressure, eraser: self.eraser, pose }));
     }
-
+ 
     /// A touch of a panel, bar, menu or dialog (not of the canvas).
     fn is_ui_touch(&self, pos: Pos2) -> bool {
         !self.canvas.contains(pos) || self.ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
     }
-
+ 
     #[allow(clippy::too_many_arguments)]
     fn touch_input(&mut self, kind: c_int, id: i32, phase: c_int, pos: Pos2, pressure: f32, mods: egui::Modifiers, pose: PenPose) {
         let phase = match phase {
@@ -758,7 +758,7 @@ impl Host {
             }
         }
     }
-
+ 
     /// A held press that moves is a drag: it goes through as it is.
     fn leave_gate_on_move(&mut self, pos: Pos2) {
         if let Some(g) = self.gate {
@@ -773,7 +773,7 @@ impl Host {
             }
         }
     }
-
+ 
     /// The press lifted while held back: the tap goes through (an eyedropper tap applies).
     fn end_gate_on_lift(&mut self, _completed: bool) {
         // A tap goes through as a plain click: the eyedropper picks, the pen places a point.
@@ -781,7 +781,7 @@ impl Host {
             self.flush_gate(false);
         }
     }
-
+ 
     fn with_shift(&self, mut m: egui::Modifiers) -> egui::Modifiers {
         if self.shift_finger.is_some() {
             m.shift = true;
@@ -791,11 +791,11 @@ impl Host {
         }
         m
     }
-
+ 
     fn pen_recent(&self) -> bool {
         self.pen.is_some() || self.last_pen_end.is_some_and(|t| t.elapsed() < Duration::from_millis(250))
     }
-
+ 
     fn handle_output(&self, out: &egui::PlatformOutput) {
         for cmd in &out.commands {
             match cmd {
@@ -815,11 +815,11 @@ impl Host {
             }
         }
     }
-
+ 
     fn flags(&self, drew: bool) -> c_int {
         (drew as c_int) | ((self.wants_keyboard as c_int) << 1)
     }
-
+ 
     fn frame(&mut self) -> c_int {
         let now = Instant::now();
         let due = self.deadline.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| now >= t);
@@ -827,7 +827,7 @@ impl Host {
             return self.flags(false);
         }
         *self.deadline.lock().unwrap_or_else(|e| e.into_inner()) = None;
-
+ 
         // A finger resting on a panel, bar or menu presses: hold to drag a panel, drag to scroll.
         if let Some(u) = self.ui_touch
             && !u.scrolling
@@ -836,8 +836,8 @@ impl Host {
             self.ui_touch = None;
             self.press(u.id, u.origin, PointerButton::Primary, u.mods);
         }
-
-
+ 
+ 
         let ppp = self.scale * self.ctx.zoom_factor().max(0.1);
         let rect = egui::Rect::from_min_size(
             Pos2::ZERO,
@@ -854,10 +854,10 @@ impl Host {
             v.native_pixels_per_point = Some(self.scale);
             v.inner_rect = Some(rect);
         }
-
+ 
         // Our own Touch Space replaces the built-in Touch workspace: never switch to it by itself.
         self.app.session.prefs.touch_workspace = false;
-
+ 
         // A press held back for press-and-hold: held long enough, it goes through.
         if let Some(g) = self.gate {
             if g.started.elapsed() >= HOLD {
@@ -875,7 +875,7 @@ impl Host {
                 wake_at(&self.deadline, Instant::now() + Duration::from_millis(40));
             }
         }
-
+ 
         let ctx = self.ctx.clone();
         self.app.raw_input_hook(&ctx, &mut raw);
         let logic = ctx.run_logic(&raw, |c| self.app.logic(c));
@@ -892,21 +892,21 @@ impl Host {
             self.events.push(Event::Key { key: egui::Key::Delete, physical_key: Some(egui::Key::Delete), pressed: false, repeat: false, modifiers: m });
             self.wake();
         }
-
+ 
         // The on-screen keyboard only where text can be typed: a text field, or the Type tool.
         self.wants_keyboard = full.platform_output.ime.is_some() || logic.platform_output.ime.is_some();
-
-
+ 
+ 
         if let Some(vo) = full.viewport_output.get(&egui::ViewportId::ROOT)
             && let Some(at) = Instant::now().checked_add(vo.repaint_delay)
         {
             wake_at(&self.deadline, at);
         }
-
+ 
         let ppp_out = full.pixels_per_point;
         let shapes = std::mem::take(&mut full.shapes);
         let prims = ctx.tessellate(shapes, ppp_out);
-
+ 
         let deadline = self.deadline.clone();
         let gpu = &mut self.gpu;
         for (id, deltas) in full.textures_delta.set.drain() {
@@ -914,7 +914,7 @@ impl Host {
                 gpu.renderer.update_texture(&gpu.device, &gpu.queue, id, &d);
             }
         }
-
+ 
         if gpu.needs_reconfigure {
             gpu.surface.configure(&gpu.device, &gpu.config);
             gpu.needs_reconfigure = false;
@@ -937,7 +937,7 @@ impl Host {
                 }
             }
         };
-
+ 
         if let Some(frame) = frame {
             let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
             let mut encoder = gpu
@@ -970,7 +970,7 @@ impl Host {
             gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
             gpu.queue.present(frame);
         }
-
+ 
         for id in full.textures_delta.free.drain() {
             gpu.renderer.free_texture(&id);
         }
@@ -990,17 +990,17 @@ impl Host {
         self.flags(true)
     }
 }
-
+ 
 // ---------------------------------------------------------------------------------------------
 // The C interface Swift calls
 // ---------------------------------------------------------------------------------------------
-
+ 
 unsafe fn host<'a>(h: *mut c_void) -> Option<&'a mut Host> {
     unsafe { (h as *mut Host).as_mut() }
 }
-
+ 
 static HOOK: Once = Once::new();
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_create(layer: *mut c_void, width_px: u32, height_px: u32, scale: f32, cb: VCCallbacks) -> *mut c_void {
     HOOK.call_once(|| {
@@ -1016,14 +1016,14 @@ pub unsafe extern "C" fn vc_create(layer: *mut c_void, width_px: u32, height_px:
         }
     })
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_destroy(h: *mut c_void) {
     if !h.is_null() {
         guard((), || drop(unsafe { Box::from_raw(h as *mut Host) }));
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_resize(h: *mut c_void, width_px: u32, height_px: u32, scale: f32) {
     guard((), || {
@@ -1036,7 +1036,7 @@ pub unsafe extern "C" fn vc_resize(h: *mut c_void, width_px: u32, height_px: u32
         }
     })
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_set_dark(h: *mut c_void, dark: c_int) {
     if let Some(h) = unsafe { host(h) } {
@@ -1044,7 +1044,7 @@ pub unsafe extern "C" fn vc_set_dark(h: *mut c_void, dark: c_int) {
         h.wake();
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_set_focused(h: *mut c_void, focused: c_int) {
     if let Some(h) = unsafe { host(h) } {
@@ -1052,13 +1052,13 @@ pub unsafe extern "C" fn vc_set_focused(h: *mut c_void, focused: c_int) {
         h.wake();
     }
 }
-
+ 
 /// An Apple Pencil was used on this iPad before: fingers only navigate from the start.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_set_pen_seen(_h: *mut c_void, seen: c_int) {
     touch::set_pen_seen(seen != 0);
 }
-
+ 
 /// Apple Pencil double tap or squeeze: turn the pen to its eraser, and back.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_toggle_eraser(h: *mut c_void) {
@@ -1068,9 +1068,9 @@ pub unsafe extern "C" fn vc_toggle_eraser(h: *mut c_void) {
         h.wake();
     }
 }
-
+ 
 // --- mouse and trackpad ---------------------------------------------------------------------
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pointer_moved(h: *mut c_void, x: f32, y: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1082,7 +1082,7 @@ pub unsafe extern "C" fn vc_pointer_moved(h: *mut c_void, x: f32, y: f32, mods: 
         h.push(Event::PointerMoved(p));
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pointer_gone(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
@@ -1094,7 +1094,7 @@ pub unsafe extern "C" fn vc_pointer_gone(h: *mut c_void) {
         h.push(Event::PointerGone);
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pointer_button(h: *mut c_void, x: f32, y: f32, button: c_int, pressed: c_int, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1114,7 +1114,7 @@ pub unsafe extern "C" fn vc_pointer_button(h: *mut c_void, x: f32, y: f32, butto
         h.push(Event::PointerButton { pos, button, pressed: pressed != 0, modifiers: m });
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1130,7 +1130,7 @@ pub unsafe extern "C" fn vc_scroll(h: *mut c_void, dx: f32, dy: f32, mods: u32) 
         });
     }
 }
-
+ 
 /// A trackpad pinch (finger pinches reach the app as touches).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pinch(h: *mut c_void, factor: f32) {
@@ -1140,9 +1140,9 @@ pub unsafe extern "C" fn vc_pinch(h: *mut c_void, factor: f32) {
         }
     }
 }
-
+ 
 // --- fingers and Apple Pencil ---------------------------------------------------------------
-
+ 
 /// One contact. `kind`: 0 finger, 1 Apple Pencil. `phase`: 0 start, 1 move, 2 end, 3 cancel.
 /// `pressure`: 0..1. `tilt_x`, `tilt_y` (degrees) and `roll` (degrees): NaN when not known.
 #[unsafe(no_mangle)]
@@ -1168,9 +1168,9 @@ pub unsafe extern "C" fn vc_touch(
         h.touch_input(kind, id, phase, pos, pressure, to_mods(mods), pose);
     }
 }
-
+ 
 // --- keyboard and clipboard -----------------------------------------------------------------
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_key(h: *mut c_void, hid: u32, pressed: c_int, repeat: c_int, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
@@ -1180,7 +1180,7 @@ pub unsafe extern "C" fn vc_key(h: *mut c_void, hid: u32, pressed: c_int, repeat
         h.push(Event::Key { key, physical_key: Some(key), pressed: pressed != 0, repeat: repeat != 0, modifiers: m });
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_text(h: *mut c_void, utf8: *const c_char) {
     if let Some(h) = unsafe { host(h) }
@@ -1190,21 +1190,21 @@ pub unsafe extern "C" fn vc_text(h: *mut c_void, utf8: *const c_char) {
         h.push(Event::Text(s));
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_copy(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
         h.push(Event::Copy);
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_cut(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
         h.push(Event::Cut);
     }
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_paste(h: *mut c_void, utf8: *const c_char) {
     if let Some(h) = unsafe { host(h) }
@@ -1213,9 +1213,9 @@ pub unsafe extern "C" fn vc_paste(h: *mut c_void, utf8: *const c_char) {
         h.push(Event::Paste(s));
     }
 }
-
+ 
 // --- files ------------------------------------------------------------------------------------
-
+ 
 /// The file the person picked for File › Open.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_open_file(h: *mut c_void, name: *const c_char, data: *const u8, len: usize) {
@@ -1228,7 +1228,7 @@ pub unsafe extern "C" fn vc_open_file(h: *mut c_void, name: *const c_char, data:
         h.wake();
     }
 }
-
+ 
 /// The open picker was cancelled (the app waits for an answer either way).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_open_cancel(h: *mut c_void) {
@@ -1237,7 +1237,7 @@ pub unsafe extern "C" fn vc_open_cancel(h: *mut c_void) {
         h.wake();
     }
 }
-
+ 
 /// A file the person picked for File › Place.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_place_file(h: *mut c_void, name: *const c_char, data: *const u8, len: usize) {
@@ -1249,7 +1249,7 @@ pub unsafe extern "C" fn vc_place_file(h: *mut c_void, name: *const c_char, data
         h.wake();
     }
 }
-
+ 
 /// A file handed to the app from outside (Open in VectorCraft from Files or another app).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_drop_file(h: *mut c_void, name: *const c_char, data: *const u8, len: usize) {
@@ -1262,9 +1262,9 @@ pub unsafe extern "C" fn vc_drop_file(h: *mut c_void, name: *const c_char, data:
         h.wake();
     }
 }
-
+ 
 // --- frames and state -------------------------------------------------------------------------
-
+ 
 /// Called every display refresh. Bit 0: a frame was drawn. Bit 1: the on-screen keyboard is wanted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_frame(h: *mut c_void) -> c_int {
@@ -1273,16 +1273,16 @@ pub unsafe extern "C" fn vc_frame(h: *mut c_void) -> c_int {
         None => 0,
     })
 }
-
+ 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_save_state(h: *mut c_void) {
     if let Some(h) = unsafe { host(h) } {
         guard((), || save_prefs(&h.app));
     }
 }
-
+ 
 // --- app controls from Swift's own buttons ---------------------------------------------------
-
+ 
 /// Modifier keys held on screen (Assistive Touch): bit 0 Shift, 1 Control, 2 Option, 3 Command.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_mods(h: *mut c_void, mods: u32) {
@@ -1291,7 +1291,7 @@ pub unsafe extern "C" fn vc_mods(h: *mut c_void, mods: u32) {
         h.set_modifiers(m);
     }
 }
-
+ 
 /// Run a command of the app, e.g. `edit.undo` or `tool.select` with `{"tool":"pen"}`. 0 when it ran.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_run(h: *mut c_void, command: *const c_char, params_json: *const c_char) -> c_int {
@@ -1313,7 +1313,7 @@ pub unsafe extern "C" fn vc_run(h: *mut c_void, command: *const c_char, params_j
         }
     })
 }
-
+ 
 /// The id of the active tool (e.g. "pen"), valid until the next call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_tool_id(h: *mut c_void) -> *const c_char {
@@ -1325,7 +1325,7 @@ pub unsafe extern "C" fn vc_tool_id(h: *mut c_void) -> *const c_char {
         None => std::ptr::null(),
     }
 }
-
+ 
 /// Whether anything (objects or anchor points) is selected.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_has_selection(h: *mut c_void) -> c_int {
@@ -1336,7 +1336,7 @@ pub unsafe extern "C" fn vc_has_selection(h: *mut c_void) -> c_int {
         None => 0,
     }
 }
-
+ 
 /// The app's own colours, so the on-screen buttons follow its theme. `which`: 0 panel, 1 window
 /// (menus), 2 text, 3 accent. Returns 0xRRGGBBAA.
 #[unsafe(no_mangle)]
@@ -1352,3 +1352,4 @@ pub unsafe extern "C" fn vc_theme_color(h: *mut c_void, which: c_int) -> u32 {
     };
     u32::from_be_bytes([c.r(), c.g(), c.b(), c.a()])
 }
+ 
