@@ -222,11 +222,12 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let p = request.location
         guard vc_over_canvas(h, Float(p.x), Float(p.y)) != 0 else { return nil }
         // A small region, so the question is asked again as the pointer moves on.
-        return UIPointerRegion(rect: CGRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12), identifier: "canvas" as NSString)
+        return UIPointerRegion(rect: CGRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12), identifier: "canvas")
     }
 
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        String(describing: region.identifier ?? "") == "canvas" ? UIPointerStyle.hidden() : nil
+        // The identifier is whatever type this iOS gives it: only its text matters.
+        String(describing: region.identifier as Any).contains("canvas") ? UIPointerStyle.hidden() : nil
     }
 
     // MARK: Commands for the on-screen buttons
