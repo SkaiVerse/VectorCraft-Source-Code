@@ -77,7 +77,9 @@ final class VectorCraftViewController: UIViewController, UIDocumentPickerDelegat
         // Apple Pencil: squeeze opens the tool arc (and the context menu); double tap goes to the
         // next tool in the same tray.
         metal.onPencilSqueeze = { [weak self] point in
-            self?.showArcMenu(at: point)
+            guard let self = self else { return }
+            // A second squeeze closes the arc again.
+            if self.arcMenu != nil { self.hideArcMenu() } else { self.showArcMenu(at: point) }
         }
         metal.onPencilTap = { [weak self] in self?.cycleTray() }
 
