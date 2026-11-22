@@ -192,6 +192,8 @@ struct UiTouch {
     started: Instant,
     mods: egui::Modifiers,
     scrolling: bool,
+    /// The Apple Pencil (the toolbar and panel bar scroll with it too).
+    pen: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -613,6 +615,64 @@ impl Host {
         self.stylus.set_sample(Some(PenSample { pressure, eraser: self.eraser, pose }));
     }
 
+    /// The toolbar, or the panel bar when it is only a column of icons: what a pencil scrolls too.
+    fn is_scroll_strip(&self, pos: Pos2) -> bool {
+        if self.canvas == egui::Rect::EVERYTHING {
+            return false;
+        }
+        let ppp = self.scale * self.ctx.zoom_factor().max(0.1);
+        let screen_w = self.gpu.config.width as f32 / ppp;
+        pos.x < self.canvas.left() || (pos.x > self.canvas.right() && screen_w - self.canvas.right() < 96.0)
+    }
+
+    /// A touch that moves on a panel, bar or menu: past a little distance it scrolls what is under
+    /// it, as a trackpad would.
+    fn ui_scroll(&mut self, mut u: UiTouch, pos: Pos2, mods: egui::Modifiers) -> UiTouch {
+        if u.scrolling || (pos - u.origin).length() > SCROLL_SLOP {
+            let step = pos - u.last;
+            u.last = pos;
+            if !u.scrolling {
+                u.scrolling = true;
+                self.push(Event::PointerMoved(u.origin));
+            }
+            self.push(Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: step,
+                phase: TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: mods,
+            });
+        }
+        u
+    }
+
+    /// A touch on a panel, bar or menu that lifted: after a scroll nothing more; otherwise a tap.
+    fn ui_finish(&mut self, u: UiTouch, completed: bool) {
+        if u.scrolling {
+            self.push(Event::PointerGone);
+        } else if completed {
+            // A tap: the press goes first, the lift a frame later.
+            self.gate = Some(Gate { kind: GateKind::Frame, started: Instant::now(), origin: u.origin });
+            self.ui_press(u);
+            if u.pen {
+                self.push_touch(PEN_DEVICE, u.id, TouchPhase::End, u.origin, None);
+            }
+            self.release(u.origin, u.mods);
+            if !u.pen {
+                self.push(Event::PointerGone);
+            }
+            self.flush_gate(false);
+        }
+    }
+
+    /// The press of a touch on a panel, bar or menu (after a tap, or a hold).
+    fn ui_press(&mut self, u: UiTouch) {
+        if u.pen {
+            self.push_touch(PEN_DEVICE, u.id, TouchPhase::Start, u.origin, Some(0.5));
+        }
+        self.press(u.id, u.origin, PointerButton::Primary, u.mods);
+    }
+
     /// A touch of a panel, bar, menu or dialog (not of the canvas).
     fn is_ui_touch(&self, pos: Pos2) -> bool {
         !self.canvas.contains(pos) || self.ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
@@ -636,14 +696,27 @@ impl Host {
                     self.ui_touch = None;
                     self.cancel_fingers(pos, mods);
                     self.pen_sample(pressure, pose);
-                    // The tool hovers over the spot first, then the press lands.
-                    self.push(Event::PointerMoved(pos));
-                    self.begin_gate(pos);
                     self.pen = Some(id);
                     self.pen_origin = pos;
                     self.pen_moves = 0;
-                    self.push_touch(PEN_DEVICE, id, TouchPhase::Start, pos, force);
-                    self.press(id, pos, PointerButton::Primary, mods);
+                    if self.is_scroll_strip(pos) {
+                        // On the toolbar or the panel bar: a tap presses, a drag scrolls, a hold
+                        // then a drag drags.
+                        self.ui_touch = Some(UiTouch { id, origin: pos, last: pos, started: Instant::now(), mods, scrolling: false, pen: true });
+                        wake_at(&self.deadline, Instant::now() + UI_HOLD);
+                    } else {
+                        // The tool hovers over the spot first, then the press lands.
+                        self.push(Event::PointerMoved(pos));
+                        self.begin_gate(pos);
+                        self.push_touch(PEN_DEVICE, id, TouchPhase::Start, pos, force);
+                        self.press(id, pos, PointerButton::Primary, mods);
+                    }
+                }
+                TouchPhase::Move if self.pen == Some(id) && self.ui_touch.is_some_and(|u| u.id == id) => {
+                    if let Some(u) = self.ui_touch {
+                        let u = self.ui_scroll(u, pos, mods);
+                        self.ui_touch = Some(u);
+                    }
                 }
                 TouchPhase::Move if self.pen == Some(id) && self.hold_lock => {
                     // Held to change the point: dragging has to wait for a new press.
@@ -655,6 +728,14 @@ impl Host {
                     self.pen_sample(pressure, pose);
                     self.push_touch(PEN_DEVICE, id, TouchPhase::Move, pos, force);
                     self.push(Event::PointerMoved(pos));
+                }
+                TouchPhase::End | TouchPhase::Cancel if self.pen == Some(id) && self.ui_touch.is_some_and(|u| u.id == id) => {
+                    self.pen_sample(0.0, PenPose::default());
+                    self.pen = None;
+                    self.last_pen_end = Some(Instant::now());
+                    if let Some(u) = self.ui_touch.take() {
+                        self.ui_finish(u, phase == TouchPhase::End);
+                    }
                 }
                 TouchPhase::End | TouchPhase::Cancel if self.pen == Some(id) => {
                     note(&format!(
@@ -695,7 +776,7 @@ impl Host {
                         if self.is_ui_touch(pos) {
                             // On a panel, bar or menu: a tap presses, a drag scrolls, a hold then
                             // a drag drags.
-                            self.ui_touch = Some(UiTouch { id, origin: pos, last: pos, started: Instant::now(), mods, scrolling: false });
+                            self.ui_touch = Some(UiTouch { id, origin: pos, last: pos, started: Instant::now(), mods, scrolling: false, pen: false });
                             wake_at(&self.deadline, Instant::now() + UI_HOLD);
                         } else {
                             // On the canvas the app navigates with it (a pen having been seen).
@@ -711,23 +792,8 @@ impl Host {
                 }
                 TouchPhase::Move if self.fingers.contains(&id) => {
                     self.push_touch(FINGER_DEVICE, id, TouchPhase::Move, pos, None);
-                    if let Some(mut u) = self.ui_touch.filter(|u| u.id == id) {
-                        if u.scrolling || (pos - u.origin).length() > SCROLL_SLOP {
-                            // Scroll what is under the finger, as a trackpad would.
-                            let step = pos - u.last;
-                            u.last = pos;
-                            if !u.scrolling {
-                                u.scrolling = true;
-                                self.push(Event::PointerMoved(u.origin));
-                            }
-                            self.push(Event::MouseWheel {
-                                unit: egui::MouseWheelUnit::Point,
-                                delta: step,
-                                phase: TouchPhase::Move,
-                                source: egui::MouseWheelSource::Unknown,
-                                modifiers: mods,
-                            });
-                        }
+                    if let Some(u) = self.ui_touch.filter(|u| u.id == id) {
+                        let u = self.ui_scroll(u, pos, mods);
                         self.ui_touch = Some(u);
                     } else if self.primary == Some(id) {
                         self.push(Event::PointerMoved(pos));
@@ -738,16 +804,7 @@ impl Host {
                     self.push_touch(FINGER_DEVICE, id, phase, pos, None);
                     if let Some(u) = self.ui_touch.filter(|u| u.id == id) {
                         self.ui_touch = None;
-                        if u.scrolling {
-                            self.push(Event::PointerGone);
-                        } else if phase == TouchPhase::End {
-                            // A tap: the press goes first, the lift a frame later.
-                            self.gate = Some(Gate { kind: GateKind::Frame, started: Instant::now(), origin: u.origin });
-                            self.press(id, u.origin, PointerButton::Primary, u.mods);
-                            self.release(u.origin, u.mods);
-                            self.push(Event::PointerGone);
-                            self.flush_gate(false);
-                        }
+                        self.ui_finish(u, phase == TouchPhase::End);
                     } else if self.primary == Some(id) {
                         self.release(pos, mods);
                         self.push(Event::PointerGone);
@@ -764,7 +821,7 @@ impl Host {
             let slop = match g.kind {
                 GateKind::Frame => return,
                 // The Pen tool drags handles out at once.
-                GateKind::PenHold => 3.0,
+                GateKind::PenHold => 5.0,
                 GateKind::Eyedropper => 10.0,
             };
             if (pos - g.origin).length() > slop {
@@ -833,7 +890,7 @@ impl Host {
             && u.started.elapsed() >= UI_HOLD
         {
             self.ui_touch = None;
-            self.press(u.id, u.origin, PointerButton::Primary, u.mods);
+            self.ui_press(u);
         }
 
 
@@ -1075,6 +1132,13 @@ pub unsafe extern "C" fn vc_toggle_eraser(h: *mut c_void) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vc_pointer_moved(h: *mut c_void, x: f32, y: f32, mods: u32) {
     if let Some(h) = unsafe { host(h) } {
+        // The iPad's hover signal reports stale positions (where the pen was before it touched)
+        // while the pen is down and as it lifts. In a stroke they sent the pointer back to where
+        // it began: the stray line. While the pen is on the screen, and for a moment after, only
+        // its own touches move the pointer.
+        if h.pen_recent() {
+            return;
+        }
         if h.primary.is_none() {
             h.stylus.set(None);
         }
@@ -1352,4 +1416,17 @@ pub unsafe extern "C" fn vc_theme_color(h: *mut c_void, which: c_int) -> u32 {
         _ => v.selection.bg_fill,
     };
     u32::from_be_bytes([c.r(), c.g(), c.b(), c.a()])
+}
+
+/// Whether a point (UIKit points) is on the canvas itself (not over a panel, bar or menu): where the
+/// app draws its own cursor, so the iPad's pointer is hidden there and only there.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vc_over_canvas(h: *mut c_void, x: f32, y: f32) -> c_int {
+    match unsafe { host(h) } {
+        Some(h) => {
+            let p = h.pt(x, y);
+            c_int::from(h.canvas.contains(p) && h.ctx.layer_id_at(p).is_none_or(|l| l.order == egui::Order::Background))
+        }
+        None => 0,
+    }
 }
