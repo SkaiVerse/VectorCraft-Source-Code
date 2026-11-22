@@ -27,9 +27,9 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
     /// A touch wider than this (points) is a resting palm, not a fingertip.
     private let palmRadius: CGFloat = 70
     private var ignoredTouches = Set<ObjectIdentifier>()
-    private var twistLast = 0.0
-    private var twistTotal = 0.0
-    private var twistActive = false
+    /// The pencil is on the screen, or just left it: the hover signal is stale then.
+    private var pencilTouching = false
+    private var penQuietUntil: CFTimeInterval = 0
     /// True while a picker or alert is showing, so the view doesn't grab the keyboard back.
     var suspendFocus = false
 
@@ -215,9 +215,18 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         onPencilSqueeze?(p)
     }
 
-    // The mouse pointer is hidden: VectorCraft draws its own tool cursors.
+    // Over the canvas VectorCraft draws its own tool cursors, so the iPad's pointer is hidden there;
+    // everywhere else (panels, bars, menus) the pointer stays.
+    func pointerInteraction(_ interaction: UIPointerInteraction, regionFor request: UIPointerRegionRequest, defaultRegion: UIPointerRegion) -> UIPointerRegion? {
+        guard let h = handle else { return nil }
+        let p = request.location
+        guard vc_over_canvas(h, Float(p.x), Float(p.y)) != 0 else { return nil }
+        // A small region, so the question is asked again as the pointer moves on.
+        return UIPointerRegion(rect: CGRect(x: p.x - 6, y: p.y - 6, width: 12, height: 12), identifier: "canvas" as NSString)
+    }
+
     func pointerInteraction(_ interaction: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? {
-        UIPointerStyle.hidden()
+        String(describing: region.identifier ?? "") == "canvas" ? UIPointerStyle.hidden() : nil
     }
 
     // MARK: Commands for the on-screen buttons
@@ -443,14 +452,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         wheel.delegate = self
         addGestureRecognizer(wheel)
 
-        // Two fingers twisting: the selection turns with them, or the canvas when nothing is
-        // selected. (The fingers also reach the app as touches, which pan and zoom.)
-        let twist = UIRotationGestureRecognizer(target: self, action: #selector(twisted(_:)))
-        twist.cancelsTouchesInView = false
-        twist.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
-        twist.delegate = self
-        addGestureRecognizer(twist)
-
         // Trackpad pinch. Finger pinches reach the app as touches, which it zooms with itself.
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched(_:)))
         pinch.cancelsTouchesInView = false
@@ -462,6 +463,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
 
     @objc private func hoverMoved(_ g: UIHoverGestureRecognizer) {
         guard let h = handle else { return }
+        // While the pencil touches (and for a moment after) the hover reports old positions.
+        if pencilTouching || CACurrentMediaTime() < penQuietUntil { return }
         switch g.state {
         case .began, .changed:
             let p = g.location(in: self)
@@ -478,36 +481,6 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
         let t = g.translation(in: self)
         g.setTranslation(.zero, in: self)
         if t != .zero { vc_scroll(h, Float(t.x), Float(t.y), modBits(g.modifierFlags)) }
-    }
-
-    /// Two fingers twisting turn the canvas (clockwise on screen, as the fingers). The fingers also
-    /// reach the app as touches, which pan and zoom.
-    @objc private func twisted(_ g: UIRotationGestureRecognizer) {
-        guard handle != nil else { return }
-        let degrees = Double(g.rotation) * 180 / Double.pi
-        switch g.state {
-        case .began:
-            twistActive = false
-            twistTotal = 0
-            twistLast = 0
-        case .changed:
-            // Only a clear twist counts: a pinch or a pan wobbles a few degrees.
-            if !twistActive {
-                guard abs(degrees) > 20, fingersDown >= 2 else { return }
-                twistActive = true
-                twistLast = degrees
-                vcLog("canvas twist begins")
-            }
-            let delta = degrees - twistLast
-            twistLast = degrees
-            twistTotal += delta
-            if !run("view.rotate", "{\"angle\": \(delta)}") { vcLog("view.rotate did not run") }
-        case .ended:
-            if twistActive { vcLog("canvas twist: \(Int(twistTotal)) degrees") }
-            twistActive = false
-        default:
-            twistActive = false
-        }
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
@@ -565,6 +538,7 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
                 vc_pointer_moved(h, Float(p.x), Float(p.y), mods)
                 vc_pointer_button(h, Float(p.x), Float(p.y), pointerButton, 1, mods)
             case .pencil:
+                pencilTouching = true
                 send(t, phase: 0, event: event)
             case .direct:
                 // A palm is much wider than a fingertip: ignore it.
@@ -613,6 +587,8 @@ final class MetalView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPencil
             case .pencil:
                 send(t, phase: cancelled ? 3 : 2, event: event)
                 touchIDs[ObjectIdentifier(t)] = nil
+                pencilTouching = false
+                penQuietUntil = CACurrentMediaTime() + 0.25
             case .direct:
                 if ignoredTouches.remove(ObjectIdentifier(t)) != nil { continue }
                 fingersDown = max(0, fingersDown - 1)
